@@ -1,0 +1,11 @@
+[package]
+name = "squashfs"
+version = "0.1.0"
+authors = ["Matthew Schauer <matthew.schauer@e10x.net>"]
+edition = "2018"
+
+[build-dependencies]
+bindgen = "0.53.1"
+
+[dependencies]
+libc = "0.2"
