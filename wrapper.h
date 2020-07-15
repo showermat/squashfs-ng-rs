@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include <sqfs/block.h>
 #include <sqfs/block_processor.h>
 #include <sqfs/block_writer.h>
