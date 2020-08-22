@@ -16,7 +16,7 @@ fn dumb_canonicalize(path: &Path) -> PathBuf {
 	let mut ret = PathBuf::new();
 	for part in path.components() {
 		match part {
-			Component::Prefix(_) => panic!("What is this, Windows?"),
+			Component::Prefix(_) => panic!("What is this, Windows?"), // TODO
 			Component::CurDir => (),
 			Component::RootDir => ret.clear(),
 			Component::ParentDir => { ret.pop(); },
@@ -24,6 +24,15 @@ fn dumb_canonicalize(path: &Path) -> PathBuf {
 		}
 	}
 	ret
+}
+
+// Pass errors through, but convert missing file errors to None
+fn enoent_ok<T>(t: Result<T>) -> Result<Option<T>> {
+	match t {
+		Ok(ret) => Ok(Some(ret)),
+		Err(SquashfsError::LibraryError(_, LibError::NoEntry)) => Ok(None),
+		Err(e) => Err(e),
+	}
 }
 
 #[derive(Debug)]
@@ -36,9 +45,9 @@ pub struct Dir<'a> {
 impl<'a> Dir<'a> {
 	fn new(node: &'a Node) -> Result<Self> {
 		let compressor = node.container.compressor()?;
-		let reader = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let reader = sfs_init_check_null(&|| unsafe {
 			sqfs_dir_reader_create(&node.container.superblock, *compressor, *node.container.file, 0)
-		}, "Couldn't create directory reader")?, sfs_destroy);
+		}, "Couldn't create directory reader", sfs_destroy)?;
 		unsafe { sfs_check(sqfs_dir_reader_open_dir(*reader, node.inode.as_const(), 0), "Couldn't open directory")?; }
 		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader) })
 	}
@@ -49,20 +58,22 @@ impl<'a> Dir<'a> {
 
 	fn read<'b>(&'b self) -> Result<Node<'a>> {
 		let locked_reader = self.reader.lock().expect(LOCK_ERR);
-		let entry = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		let entry = sfs_init_ptr(&|x| unsafe {
 			sqfs_dir_reader_read(**locked_reader, x)
-		}, "Couldn't read directory entries")?, libc_free);
+		}, "Couldn't read directory entries", libc_free)?;
 		let name_bytes = unsafe { (**entry).name.as_slice((**entry).size as usize + 1) };
 		let name = String::from_utf8(name_bytes.to_vec())?;
-		let node = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		let node = sfs_init_ptr(&|x| unsafe {
 			sqfs_dir_reader_get_inode(**locked_reader, x)
-		}, "Couldn't read directory entry inode")?, libc_free);
+		}, "Couldn't read directory entry inode", libc_free)?;
 		Node::new(self.node.container, node, self.node.path.as_ref().map(|path| path.join(name)))
 	}
 
-	pub fn child(&self, name: &str) -> Result<Node> {
-		unsafe { sfs_check(sqfs_dir_reader_find(**self.reader.lock().expect(LOCK_ERR), CString::new(name)?.as_ptr()), &format!("Couldn't find child \"{}\"", name))? };
-		self.read()
+	pub fn child(&self, name: &str) -> Result<Option<Node>> {
+		match unsafe { enoent_ok(sfs_check(sqfs_dir_reader_find(**self.reader.lock().expect(LOCK_ERR), CString::new(name)?.as_ptr()), &format!("Couldn't find child \"{}\"", name)))? } {
+			None => Ok(None),
+			Some(_) => Ok(Some(self.read()?)),
+		}
 	}
 }
 
@@ -79,17 +90,16 @@ pub struct File<'a> {
 	compressor: ManagedPointer<sqfs_compressor_t>,
 	reader: Mutex<ManagedPointer<sqfs_data_reader_t>>,
 	offset: Mutex<u64>,
-	mmap: Option<(std::fs::File, MemoryMap)>, // TODO Probably not thread-safe
 }
 
 impl<'a> File<'a> {
 	fn new(node: &'a Node) -> Result<Self> {
 		let compressor = node.container.compressor()?;
-		let reader = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let reader = sfs_init_check_null(&|| unsafe {
 			sqfs_data_reader_create(*node.container.file, node.container.superblock.block_size as u64, *compressor, 0)
-		}, "Couldn't create data reader")?, sfs_destroy);
+		}, "Couldn't create data reader", sfs_destroy)?;
 		unsafe { sfs_check(sqfs_data_reader_load_fragment_table(*reader, &node.container.superblock), "Couldn't load fragment table")? };
-		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader), offset: Mutex::new(0), mmap: None })
+		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader), offset: Mutex::new(0) })
 	}
 
 	pub fn size(&self) -> u64 {
@@ -110,7 +120,7 @@ impl<'a> File<'a> {
 		Ok(ret)
 	}
 
-	pub fn mmap<'b>(&'b mut self) -> Result<Option<&'b [u8]>> {
+	pub fn mmap<'b>(&'b mut self) -> Option<&'b [u8]> {
 		let inode = unsafe { &***self.node.inode };
 		let (start, frag_idx) = unsafe {
 			match inode.base.type_ as u32 {
@@ -120,18 +130,10 @@ impl<'a> File<'a> {
 			}
 		};
 		let block_count = unsafe { inode.payload_bytes_used / std::mem::size_of::<sqfs_u32>() as u32 };
-		println!("File starts at byte {} ({})", start, MemoryMap::granularity());
-		if block_count == 0 || start == 0 || frag_idx != 0xffffffff { return Ok(None); }
+		if block_count == 0 || frag_idx != 0xffffffff { return None; }
 		let block_sizes = unsafe { inode.extra.as_slice(block_count as usize) };
-		if block_sizes.iter().any(|x| x & 0x00800000 == 0) { return Ok(None); }
-		if self.mmap.is_none() {
-			let file = std::fs::File::open(&self.node.container.path)?;
-			let map = MemoryMap::new(self.size() as usize, &vec![MapOption::MapReadable, MapOption::MapFd(file.as_raw_fd()), MapOption::MapOffset(start as usize)])?;
-			self.mmap = Some((file, map));
-		}
-		let map = &self.mmap.as_ref().expect("Just-filled mmap is empty").1;
-		println!("{:?} bytes at {:?}", map.len(), map.data());
-		unsafe { Ok(Some(std::slice::from_raw_parts(map.data(), map.len()))) }
+		if block_sizes.iter().any(|x| x & 0x01000000 == 0) { return None; }
+		Some(self.node.container.map_range(start as usize, self.size() as usize))
 	}
 }
 
@@ -315,13 +317,12 @@ impl<'a> Node<'a> {
 		if self.container.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_NO_XATTRS as u16 != 0 { Ok(HashMap::new()) }
 		else {
 			let compressor = self.container.compressor()?;
-			let xattr_reader = unsafe {
-				let ret = ManagedPointer::new(sqfs_xattr_reader_create(0), sfs_destroy);
-				sfs_check(sqfs_xattr_reader_load(*ret, &self.container.superblock, *self.container.file, *compressor), "Couldn't create xattr reader")?;
-				ret
-			};
+			let xattr_reader = sfs_init_check_null(&|| unsafe {
+					sqfs_xattr_reader_create(0)
+			}, "Coudn't create xattr reader", sfs_destroy)?;
+			unsafe { sfs_check(sqfs_xattr_reader_load(*xattr_reader, &self.container.superblock, *self.container.file, *compressor), "Couldn't load xattr reader")?; }
 			let mut xattr_idx: u32 = NO_XATTRS;
-			unsafe { sfs_check(sqfs_inode_get_xattr_index(self.inode.as_const(), &mut xattr_idx), "Couldn't get xattr index")? };
+			unsafe { sfs_check(sqfs_inode_get_xattr_index(self.inode.as_const(), &mut xattr_idx), "Couldn't get xattr index")?; }
 			let desc = sfs_init(&|x| unsafe {
 				sqfs_xattr_reader_get_desc(*xattr_reader, xattr_idx, x)
 			}, "Couldn't get xattr descriptor")?;
@@ -329,15 +330,12 @@ impl<'a> Node<'a> {
 			unsafe { sfs_check(sqfs_xattr_reader_seek_kv(*xattr_reader, &desc), "Couldn't seek to xattr location")? };
 			for _ in 0..desc.count {
 				let prefixlen = unsafe { CStr::from_ptr(sqfs_get_xattr_prefix(category as u32)).to_bytes().len() };
-				let key = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+				let key = sfs_init_ptr(&|x| unsafe {
 					sqfs_xattr_reader_read_key(*xattr_reader, x)
-				}, "Couldn't read xattr key")?, libc_free);
-				if unsafe { (**key).type_ } as u32 & SQFS_XATTR_TYPE_SQFS_XATTR_FLAG_OOL != 0 {
-					unimplemented!()
-				}
-				let val = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+				}, "Couldn't read xattr key", libc_free)?;
+				let val = sfs_init_ptr(&|x| unsafe {
 					sqfs_xattr_reader_read_value(*xattr_reader, *key, x)
-				}, "Couldn't read xattr value")?, libc_free);
+				}, "Couldn't read xattr value", libc_free)?;
 				if unsafe { (**key).type_ } as u32 & SQFS_XATTR_TYPE_SQFS_XATTR_PREFIX_MASK == category as u32 {
 					unsafe {
 						let keyvec = (**key).key.as_slice((**key).size as usize + prefixlen)[prefixlen..].to_vec();
@@ -376,7 +374,7 @@ impl<'a> Node<'a> {
 	pub fn parent(&self) -> Result<Self> {
 		self.path.as_ref().map(|path| {
 			let ppath = path.parent().unwrap_or(&Path::new(""));
-			self.container.get(&os_to_string(ppath.as_os_str())?)
+			self.container.get_exists(&os_to_string(ppath.as_os_str())?)
 		}).ok_or(SquashfsError::NoPath)?
 	}
 
@@ -398,7 +396,7 @@ impl<'a> Node<'a> {
 					if !visited.insert(target.clone()) {
 						return Err(SquashfsError::LinkLoop(target));
 					}
-					cur = Box::new(cur.container.get_path(&target)?);
+					cur = Box::new(cur.container.get_exists(&target)?);
 				}
 				_ => return Ok(*cur),
 			}
@@ -415,7 +413,8 @@ impl<'a> Node<'a> {
 	}
 
 	pub fn into_owned_file(self) -> Result<OwnedFile<'a>> {
-		Ok(OwnedFile { handle: OwningHandle::try_new(Box::new(self), |x| unsafe { (*x).as_file().map(|x| Box::new(x)) })? })
+		let resolved = self.resolve()?;
+		Ok(OwnedFile { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_file().map(|x| Box::new(x)) })? })
 	}
 
 	pub fn as_dir(&self) -> Result<Dir> {
@@ -426,7 +425,8 @@ impl<'a> Node<'a> {
 	}
 
 	pub fn into_owned_dir(self) -> Result<OwnedDir<'a>> {
-		Ok(OwnedDir { handle: OwningHandle::try_new(Box::new(self), |x| unsafe { (*x).as_dir().map(|x| Box::new(x)) })? })
+		let resolved = self.resolve()?;
+		Ok(OwnedDir { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_dir().map(|x| Box::new(x)) })? })
 	}
 
 	pub fn uid(&self) -> Result<u32> {
@@ -472,41 +472,44 @@ pub struct Archive {
 	file: ManagedPointer<sqfs_file_t>,
 	superblock: sqfs_super_t,
 	compressor_config: sqfs_compressor_config_t,
+	mmap: (std::fs::File, MemoryMap),
 }
 
 impl Archive {
 	pub fn new<T: AsRef<Path>>(path: T) -> Result<Self> {
 		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
-		let file = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let file = sfs_init_check_null(&|| unsafe {
 			sqfs_open_file(cpath.as_ptr(), SQFS_FILE_OPEN_FLAGS_SQFS_FILE_OPEN_READ_ONLY)
-		}, &format!("Couldn't open input file {}", path.as_ref().display()))?, sfs_destroy);
+		}, &format!("Couldn't open input file {}", path.as_ref().display()), sfs_destroy)?;
 		let superblock = sfs_init(&|x| unsafe {
 			sqfs_super_read(x, *file)
 		}, "Couldn't read archive superblock")?;
 		let compressor_config = sfs_init(&|x| unsafe {
 			sqfs_compressor_config_init(x, superblock.compression_id as u32, superblock.block_size as u64, SQFS_COMP_FLAG_SQFS_COMP_FLAG_UNCOMPRESS as u16)
 		}, "Couldn't read archive compressor config")?;
-		Ok(Self { path: path.as_ref().to_path_buf(), file: file, superblock: superblock, compressor_config: compressor_config })
+		let os_file = std::fs::File::open(&path)?;
+		let map = MemoryMap::new(superblock.bytes_used as usize, &vec![MapOption::MapReadable, MapOption::MapFd(os_file.as_raw_fd())])?;
+		Ok(Self { path: path.as_ref().to_path_buf(), file: file, superblock: superblock, compressor_config: compressor_config, mmap: (os_file, map) })
 	}
 
 	fn compressor(&self) -> Result<ManagedPointer<sqfs_compressor_t>> {
-		Ok(ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		Ok(sfs_init_ptr(&|x| unsafe {
 			sqfs_compressor_create(&self.compressor_config, x)
-		}, "Couldn't create compressor")?, sfs_destroy))
+		}, "Couldn't create compressor", sfs_destroy)?)
 	}
 
 	fn meta_reader(&self, compressor: &ManagedPointer<sqfs_compressor_t>, bounds: Option<(u64, u64)>) -> Result<ManagedPointer<sqfs_meta_reader_t>> {
 		let range = bounds.unwrap_or((0, self.superblock.bytes_used));
-		Ok(ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		Ok(sfs_init_check_null(&|| unsafe {
 			sqfs_meta_reader_create(*self.file, **compressor, range.0, range.1)
-		}, "Couldn't create metadata reader")?, sfs_destroy))
+		}, "Couldn't create metadata reader", sfs_destroy)?)
 	}
 
 	fn id_lookup(&self, idx: u16) -> Result<u32> {
 		// TODO Consider chaching the ID table to make lookups more efficient
-		let mut id_table = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let mut id_table = sfs_init_check_null(&|| unsafe {
 			sqfs_id_table_create(0)
-		}, "Couldn't create ID table")?, sfs_destroy);
+		}, "Couldn't create ID table", sfs_destroy)?;
 		let compressor = self.compressor()?;
 		unsafe { sfs_check(sqfs_id_table_read(*id_table, *self.file, &self.superblock, *compressor), "Couldn't read ID table")?; }
 		Ok(sfs_init(&|x| unsafe {
@@ -518,28 +521,32 @@ impl Archive {
 		self.superblock.inode_count
 	}
 
-	pub fn get_path<T: AsRef<Path>>(&self, path: T) -> Result<Node> {
+	pub fn get_exists<T: AsRef<Path>>(&self, path: T) -> Result<Node> {
 		let compressor = self.compressor()?;
-		let dir_reader = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let dir_reader = sfs_init_check_null(&|| unsafe {
 			sqfs_dir_reader_create(&self.superblock, *compressor, *self.file, 0)
-		}, "Couldn't create directory reader")?, sfs_destroy);
-		let root = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		}, "Couldn't create directory reader", sfs_destroy)?;
+		let root = sfs_init_ptr(&|x| unsafe {
 			sqfs_dir_reader_get_root_inode(*dir_reader, x)
-		}, "Couldn't get filesystem root")?, libc_free);
+		}, "Couldn't get filesystem root", libc_free)?;
 		let pathbuf = dumb_canonicalize(path.as_ref());
 		if &pathbuf == Path::new("/") {
 			Node::new(&self, root, Some(pathbuf))
 		}
 		else {
 			let cpath = CString::new(os_to_string(pathbuf.as_os_str())?)?;
-			let inode = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+			let inode = sfs_init_ptr(&|x| unsafe {
 				sqfs_dir_reader_find_by_path(*dir_reader, *root, cpath.as_ptr(), x)
-			}, &format!("Unable to access path {}", path.as_ref().display()))?, libc_free);
+			}, &format!("Unable to access path {}", path.as_ref().display()), libc_free)?;
 			Node::new(&self, inode, Some(pathbuf))
 		}
 	}
 
-	pub fn get_id(&self, id: u64) -> Result<Node> {
+	pub fn get<T: AsRef<Path>>(&self, path: T) -> Result<Option<Node>> {
+		enoent_ok(self.get_exists(path))
+	}
+
+	pub fn get_id(&self, id: u64) -> Result<Node> { // TODO Return Result<Option<Node>> here as well
 		if self.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_EXPORTABLE as u16 == 0 { Err(SquashfsError::Unsupported("inode indexing".to_string()))?; }
 		if id <= 0 || id > self.superblock.inode_count as u64 { Err(SquashfsError::Range(id, self.superblock.inode_count as u64))? }
 		let compressor = self.compressor()?;
@@ -556,31 +563,32 @@ impl Archive {
 			sfs_check(sqfs_meta_reader_read(*export_reader, &mut noderef as *mut u64 as *mut libc::c_void, 8), "Couldn't read inode reference")?;
 		}
 		let (block, offset) = unpack_meta_ref(noderef);
-		let inode = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		let inode = sfs_init_ptr(&|x| unsafe {
 			sqfs_meta_reader_read_inode(*export_reader, &self.superblock, block, offset, x)
-		}, "Couldn't read inode")?, libc_free);
+		}, "Couldn't read inode", libc_free)?;
 		Node::new(&self, inode, None)
 	}
 
-	pub fn get(&self, path: &str) -> Result<Node> {
-		self.get_path(Path::new(path))
+	fn map_range(&self, start: usize, len: usize) -> &[u8] {
+		let map = &self.mmap.1;
+		unsafe { std::slice::from_raw_parts(map.data().offset(start as isize), len) }
 	}
 
-	pub fn names_from_dirent_refs(&mut self, dirent_refs: &[u64]) -> Result<Vec<String>> {
+	/*pub fn names_from_dirent_refs(&mut self, dirent_refs: &[u64]) -> Result<Vec<String>> {
 		let compressor = self.compressor()?;
 		let meta_reader = self.meta_reader(&compressor, None)?; // TODO Set bounds
 		let mut ret = Vec::with_capacity(dirent_refs.len());
 		for dirent_ref in dirent_refs {
 			let (block, offset) = unpack_meta_ref(*dirent_ref);
 			unsafe { sfs_check(sqfs_meta_reader_seek(*meta_reader, block, offset), "Couldn't seek to directory entry")?; }
-			let entry = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+			let entry = sfs_init_ptr(&|x| unsafe {
 				sqfs_meta_reader_read_dir_ent(*meta_reader, x)
-			}, "Couldn't read directory entry by reference")?, libc_free);
+			}, "Couldn't read directory entry by reference", libc_free)?;
 			let name_bytes = unsafe { (**entry).name.as_slice((**entry).size as usize + 1) };
 			ret.push(String::from_utf8(name_bytes.to_vec())?);
 		}
 		Ok(ret)
-	}
+	}*/
 }
 
 unsafe impl Send for Archive { }

@@ -8,6 +8,7 @@ edition = "2018"
 bindgen = "0.53.1"
 
 [dependencies]
+lazy_static = "1.4"
 libc = "0.2"
 mmap = "0.1"
 num-traits = "0.2"
@@ -15,3 +16,4 @@ num-derive = "0.3"
 owning_ref = "0.4"
 thiserror = "1.0"
 walkdir = "2.3"
+xattr = "0.2"

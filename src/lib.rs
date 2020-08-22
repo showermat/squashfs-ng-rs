@@ -1,11 +1,12 @@
+#[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate mmap;
 extern crate num_derive;
 extern crate num_traits;
 extern crate owning_ref;
 extern crate walkdir;
+extern crate xattr;
 
-// TODO Use AsRef<Path> rather than Path for public interfaces
 use std::mem::MaybeUninit;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -25,6 +26,8 @@ mod bindings {
 
 pub mod read;
 pub mod write;
+
+type BoxedError = Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>;
 
 #[derive(Error, Debug, FromPrimitive)]
 #[repr(i32)]
@@ -68,6 +71,9 @@ pub enum SquashfsError {
 	#[error("Memory mapping failed: {0}")] Mmap(#[from] mmap::MapError),
 	#[error("Couldn't get the current system time: {0}")] Time(#[from] std::time::SystemTimeError),
 	#[error("Refusing to create empty archive")] Empty,
+	#[error("Tried to write directory {0} before child {1}")] WriteOrder(u32, u32),
+	#[error("Tried to write unknown or unsupported file type")] WriteType(std::fs::FileType),
+	#[error("Callback returned an error")] WrappedError(BoxedError),
 }
 
 type Result<T> = std::result::Result<T, SquashfsError>;
@@ -80,26 +86,6 @@ fn sfs_check(code: i32, desc: &str) -> Result<i32> {
 			None => Err(SquashfsError::UnknownLibraryError(desc.to_string(), i)),
 		}
 	}
-}
-
-// TODO Make these three funtions return ManagedPointer rather than requiring the caller to do the wrappning
-fn sfs_init<T>(init: &dyn Fn(*mut T) -> i32, err: &str) -> Result<T> {
-	let mut ret: MaybeUninit<T> = MaybeUninit::uninit();
-	sfs_check(init(ret.as_mut_ptr()), err)?;
-	Ok(unsafe { ret.assume_init() })
-}
-
-fn sfs_init_ptr<T>(init: &dyn Fn(*mut *mut T) -> i32, err: &str) -> Result<*mut T> {
-	let mut ret: *mut T = ptr::null_mut();
-	sfs_check(init(&mut ret), err)?;
-	if ret.is_null() { Err(SquashfsError::LibraryReturnError(err.to_string())) }
-	else { Ok(ret) }
-}
-
-fn sfs_init_check_null<T>(init: &dyn Fn() -> *mut T, err: &str) -> Result<*mut T> {
-	let ret = init();
-	if ret.is_null() { Err(SquashfsError::LibraryNullError(err.to_string())) }
-	else { Ok(ret) }
 }
 
 fn sfs_destroy<T>(x: *mut T) {
@@ -174,4 +160,23 @@ impl<T> std::fmt::Debug for ManagedPointer<T> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "ManagedPointer({:?})", self.ptr)
 	}
+}
+
+fn sfs_init<T>(init: &dyn Fn(*mut T) -> i32, err: &str) -> Result<T> {
+	let mut ret: MaybeUninit<T> = MaybeUninit::uninit();
+	sfs_check(init(ret.as_mut_ptr()), err)?;
+	Ok(unsafe { ret.assume_init() })
+}
+
+fn sfs_init_ptr<T>(init: &dyn Fn(*mut *mut T) -> i32, err: &str, destroy: fn(*mut T)) -> Result<ManagedPointer<T>> {
+	let mut ret: *mut T = ptr::null_mut();
+	sfs_check(init(&mut ret), err)?;
+	if ret.is_null() { Err(SquashfsError::LibraryReturnError(err.to_string())) }
+	else { Ok(ManagedPointer::new(ret, destroy)) }
+}
+
+fn sfs_init_check_null<T>(init: &dyn Fn() -> *mut T, err: &str, destroy: fn(*mut T)) -> Result<ManagedPointer<T>> {
+	let ret = init();
+	if ret.is_null() { Err(SquashfsError::LibraryNullError(err.to_string())) }
+	else { Ok(ManagedPointer::new(ret, destroy)) }
 }

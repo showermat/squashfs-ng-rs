@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use bindings::*;
 use super::*;
@@ -30,16 +30,26 @@ pub enum SourceData {
 }
 
 pub struct Source {
-	data: SourceData,
-	xattrs: HashMap<OsString, Vec<u8>>,
-	uid: u32,
-	gid: u32,
-	mode: u16,
-	modified: u32,
-	flags: u32,
+	pub data: SourceData,
+	pub uid: u32,
+	pub gid: u32,
+	pub mode: u16,
+	pub modified: u32,
+	pub xattrs: HashMap<OsString, Vec<u8>>,
+	pub flags: u32,
 }
 
-fn copy_metadata(src: &ManagedPointer<sqfs_inode_generic_t>, dst: &mut ManagedPointer<sqfs_inode_generic_t>) {
+fn file_xattrs(path: &Path) -> Result<HashMap<OsString, Vec<u8>>> {
+	xattr::list(path)?.map(|attr| {
+		match xattr::get(path, attr.clone()) {
+			Err(e) => panic!(), // TODO Panics
+			Ok(None) => panic!(), //Err(anyhow!("Couldn't retrieve xattr \"{:?}\" reported to be present", attr)),
+			Ok(Some(value)) => Ok((attr, value))
+		}
+	}).collect()
+}
+
+fn copy_metadata(src: &ManagedPointer<sqfs_inode_generic_t>, dst: &mut ManagedPointer<sqfs_inode_generic_t>) -> Result<()> {
 	fn nlink_ref(inode: &ManagedPointer<sqfs_inode_generic_t>) -> Option<&u32> {
 		unimplemented!();
 	}
@@ -49,12 +59,17 @@ fn copy_metadata(src: &ManagedPointer<sqfs_inode_generic_t>, dst: &mut ManagedPo
 	dst_base.gid_idx = src_base.gid_idx;
 	dst_base.mod_time = src_base.mod_time;
 	dst_base.inode_number = src_base.inode_number;
-	// TODO xattr_idx, uid, git, mode, mtime, link_count
+	let mut xattr_idx: u32 = 0;
+	unsafe {
+		sfs_check(sqfs_inode_get_xattr_index(**src, &mut xattr_idx), "Couldn't get xattr index")?;
+		sfs_check(sqfs_inode_set_xattr_index(**dst, xattr_idx), "Couldn't set xattr index")?;
+	}
+	Ok(())
 }
 
 impl Source {
-	pub fn new(data: SourceData, xattrs: HashMap<OsString, Vec<u8>>, parent: u32, flags: u32) -> Self { // TODO Parent not necessary?
-		Self { data: data, xattrs: xattrs, uid: 1000, gid: 1001, mode: 0x1ff, modified: 0, flags: flags }
+	pub fn defaults(data: SourceData) -> Self {
+		Self { data: data, uid: 0, gid: 0, mode: 0x1ff, modified: 0, xattrs: HashMap::new(), flags: 0 }
 	}
 
 	fn devno(maj: u32, min: u32) -> u32 {
@@ -128,7 +143,11 @@ struct IntermediateNode {
 	inode: Box<ManagedPointer<sqfs_inode_generic_t>>,
 	dir_children: Option<Box<dyn Iterator<Item=(OsString, u32)>>>,
 	pos: u64,
-	parent: u32, // TODO Calculate rather than requiring
+}
+
+pub struct SourceFile {
+	pub path: PathBuf,
+	pub content: Source,
 }
 
 pub struct Writer {
@@ -148,48 +167,48 @@ pub struct Writer {
 }
 
 impl Writer {
-	pub fn open(path: &Path) -> Result<Self> {
-		let cpath = CString::new(os_to_string(path.as_os_str())?)?;
+	pub fn open<T: AsRef<Path>>(path: T) -> Result<Self> {
+		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
 		let block_size = SQFS_DEFAULT_BLOCK_SIZE as u64;
-		let num_workers = 1;
+		let num_workers = 4; // TODO Get from core count
 		let compressor_id = SQFS_COMPRESSOR_SQFS_COMP_ZSTD;
-		let now = 0; // TODO Get current timestamp
-		let outfile = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
+		let outfile = sfs_init_check_null(&|| unsafe {
 			sqfs_open_file(cpath.as_ptr(), SQFS_FILE_OPEN_FLAGS_SQFS_FILE_OPEN_OVERWRITE)
-		}, &format!("Couldn't open output file {}", path.display()))?, sfs_destroy);
+		}, &format!("Couldn't open output file {}", path.as_ref().display()), sfs_destroy)?;
 		let compressor_config = sfs_init(&|x| unsafe {
 			sqfs_compressor_config_init(x, compressor_id, block_size, 0)
 		}, "Couldn't create compressor config")?;
-		let compressor = ManagedPointer::new(sfs_init_ptr(&|x| unsafe {
+		let compressor = sfs_init_ptr(&|x| unsafe {
 			sqfs_compressor_create(&compressor_config, x)
-		}, "Couldn't create compressor")?, sfs_destroy);
+		}, "Couldn't create compressor", sfs_destroy)?;
 		let superblock = sfs_init(&|x| unsafe {
 			sqfs_super_init(x, block_size, now, compressor_id)
 		}, "Couldn't create superblock")?;
-		let frag_table = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		let frag_table = sfs_init_check_null(&|| unsafe {
 			sqfs_frag_table_create(0)
-		}, "Couldn't create fragment table")?, sfs_destroy);
-		let block_writer = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create fragment table", sfs_destroy)?;
+		let block_writer = sfs_init_check_null(&|| unsafe {
 			sqfs_block_writer_create(*outfile, 4096, 0)
-		}, "Couldn't create block writer")?, sfs_destroy);
-		let block_processor = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create block writer", sfs_destroy)?;
+		let block_processor = sfs_init_check_null(&|| unsafe {
 			sqfs_block_processor_create(block_size, *compressor, num_workers, 10 * num_workers as u64, *block_writer, *frag_table)
-		}, "Couldn't create block processor")?, sfs_destroy);
-		let id_table = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create block processor", sfs_destroy)?;
+		let id_table = sfs_init_check_null(&|| unsafe {
 			sqfs_id_table_create(0)
-		}, "Couldn't create ID table")?, sfs_destroy);
-		let xattr_writer = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create ID table", sfs_destroy)?;
+		let xattr_writer = sfs_init_check_null(&|| unsafe {
 			sqfs_xattr_writer_create(0)
-		}, "Couldn't create xattr writer")?, sfs_destroy);
-		let inode_writer = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create xattr writer", sfs_destroy)?;
+		let inode_writer = sfs_init_check_null(&|| unsafe {
 			sqfs_meta_writer_create(*outfile, *compressor, 0)
-		}, "Couldn't create inode metadata writer")?, sfs_destroy);
-		let dirent_writer = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
-			sqfs_meta_writer_create(*outfile, *compressor, SQFS_META_WRITER_FLAGS_SQFS_META_WRITER_KEEP_IN_MEMORY) // TODO Untangle so we don't have to keep in memory
-		}, "Couldn't create directory entry metadata writer")?, sfs_destroy);
-		let dir_writer = ManagedPointer::new(sfs_init_check_null(&|| unsafe {
+		}, "Couldn't create inode metadata writer", sfs_destroy)?;
+		let dirent_writer = sfs_init_check_null(&|| unsafe {
+			sqfs_meta_writer_create(*outfile, *compressor, SQFS_META_WRITER_FLAGS_SQFS_META_WRITER_KEEP_IN_MEMORY)
+		}, "Couldn't create directory entry metadata writer", sfs_destroy)?;
+		let dir_writer = sfs_init_check_null(&|| unsafe {
 			sqfs_dir_writer_create(*dirent_writer, SQFS_DIR_WRITER_CREATE_FLAGS_SQFS_DIR_WRITER_CREATE_EXPORT_TABLE)
-		}, "Couldn't create directory writer")?, sfs_destroy);
+		}, "Couldn't create directory writer", sfs_destroy)?;
 		unsafe {
 			sfs_check(sqfs_super_write(&superblock, *outfile), "Couldn't write archive superblock")?;
 			sfs_check((**compressor).write_options.expect("Compressor doesn't provide write_options")(*compressor, *outfile), "Couldn't write compressor options")?;
@@ -212,24 +231,26 @@ impl Writer {
 	}
 
 	fn mode_from_inode(inode: &ManagedPointer<sqfs_inode_generic_t>) -> u16 {
-		let typenums = vec![ // TODO Lazy static
-			(SQFS_INODE_TYPE_SQFS_INODE_DIR, S_IFDIR),
-			(SQFS_INODE_TYPE_SQFS_INODE_FILE, S_IFREG),
-			(SQFS_INODE_TYPE_SQFS_INODE_SLINK, S_IFLNK),
-			(SQFS_INODE_TYPE_SQFS_INODE_BDEV, S_IFBLK),
-			(SQFS_INODE_TYPE_SQFS_INODE_CDEV, S_IFCHR),
-			(SQFS_INODE_TYPE_SQFS_INODE_FIFO, S_IFIFO),
-			(SQFS_INODE_TYPE_SQFS_INODE_SOCKET, S_IFSOCK),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_DIR, S_IFDIR),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_FILE, S_IFREG),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_SLINK, S_IFLNK),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_BDEV, S_IFBLK),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_CDEV, S_IFCHR),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_FIFO, S_IFIFO),
-			(SQFS_INODE_TYPE_SQFS_INODE_EXT_SOCKET, S_IFSOCK),
-		].into_iter().collect::<HashMap<u32, u32>>();
+		lazy_static! {
+			static ref TYPENUMS: HashMap<u32, u32> = vec![
+				(SQFS_INODE_TYPE_SQFS_INODE_DIR, S_IFDIR),
+				(SQFS_INODE_TYPE_SQFS_INODE_FILE, S_IFREG),
+				(SQFS_INODE_TYPE_SQFS_INODE_SLINK, S_IFLNK),
+				(SQFS_INODE_TYPE_SQFS_INODE_BDEV, S_IFBLK),
+				(SQFS_INODE_TYPE_SQFS_INODE_CDEV, S_IFCHR),
+				(SQFS_INODE_TYPE_SQFS_INODE_FIFO, S_IFIFO),
+				(SQFS_INODE_TYPE_SQFS_INODE_SOCKET, S_IFSOCK),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_DIR, S_IFDIR),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_FILE, S_IFREG),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_SLINK, S_IFLNK),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_BDEV, S_IFBLK),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_CDEV, S_IFCHR),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_FIFO, S_IFIFO),
+				(SQFS_INODE_TYPE_SQFS_INODE_EXT_SOCKET, S_IFSOCK),
+			].into_iter().collect();
+		}
 		let base = unsafe { (***inode).base };
-		typenums[&(base.type_ as u32)] as u16 | base.mode
+		TYPENUMS[&(base.type_ as u32)] as u16 | base.mode
 	}
 
 	fn outfile_size(&self) -> u64 {
@@ -261,22 +282,22 @@ impl Writer {
 			sfs_check(sqfs_xattr_writer_begin(*self.xattr_writer, 0), "Couldn't start writing xattrs")?;
 			for (key, value) in &source.xattrs {
 				let ckey = CString::new(os_to_string(key)?)?;
-				sfs_check(sqfs_xattr_writer_add(*self.xattr_writer, ckey.as_ptr() as *const i8, value as &[u8] as *const [u8] as *const libc::c_void, value.len() as u64), "Couldn't add xattr")?;
+				sfs_check(sqfs_xattr_writer_add(*self.xattr_writer, ckey.as_ptr() as *const i8, value.as_ptr() as *const libc::c_void, value.len() as u64), "Couldn't add xattr")?;
 			}
 			let xattr_idx = unsafe { sfs_init(&|x| sqfs_xattr_writer_end(*self.xattr_writer, x), "Couldn't finish writing xattrs")? };
 			let mut base = &mut (***inode).base;
 			base.mode = source.mode;
 			sqfs_inode_set_xattr_index(**inode, xattr_idx);
-			sfs_check(sqfs_id_table_id_to_index(*self.id_table, source.uid, &mut base.uid_idx), "Couldn't set inode UID");
-			sfs_check(sqfs_id_table_id_to_index(*self.id_table, source.gid, &mut base.gid_idx), "Couldn't set inode GID");
+			sfs_check(sqfs_id_table_id_to_index(*self.id_table, source.uid, &mut base.uid_idx), "Couldn't set inode UID")?;
+			sfs_check(sqfs_id_table_id_to_index(*self.id_table, source.gid, &mut base.gid_idx), "Couldn't set inode GID")?;
 			base.mod_time = source.modified;
-			base.inode_number = self.nodes.len() as u32 + 1;;
+			base.inode_number = self.nodes.len() as u32 + 1;
 		}
 		let dir_children = match source.data {
 			SourceData::Dir(children) => Some(children),
 			_ => None,
 		};
-		self.nodes.push(RefCell::new(IntermediateNode { inode: inode, dir_children: dir_children, pos: 0, parent: 0 }));
+		self.nodes.push(RefCell::new(IntermediateNode { inode: inode, dir_children: dir_children, pos: 0 }));
 		Ok(self.nodes.len() as u32)
 	}
 
@@ -287,20 +308,21 @@ impl Writer {
 			for raw_node in &self.nodes {
 				let mut node = raw_node.borrow_mut();
 				// TODO Handle extended inodes properly
-				// TODO What happens if a dir tries to include itself as a child?  Probably a RefCell borrow panic.
 				let id = (***node.inode).base.inode_number;
 				if let Some(children) = node.dir_children.take() {
 					sfs_check(sqfs_dir_writer_begin(*self.dir_writer, 0), "Couldn't start writing directory")?;
 					// For each child, need: name, ID, reference, mode
 					for (name, child_id) in children { // TODO Check that children are sorted
-						if child_id >= id { panic!("Tried to write directory {} before child {}", id, child_id) } // TODO Allocate error
+						if child_id >= id { Err(SquashfsError::WriteOrder(id, child_id))?; }
 						let child_node = &self.nodes[child_id as usize - 1].borrow();
 						let child = child_node.inode.as_ref();
 						let child_ref = child_node.pos;
 						sfs_check(sqfs_dir_writer_add_entry(*self.dir_writer, CString::new(os_to_string(&name)?)?.as_ptr(), child_id, child_ref, Self::mode_from_inode(&child)), "Couldn't add directory entry")?;
 					}
 					sfs_check(sqfs_dir_writer_end(*self.dir_writer), "Couldn't finish writing directory")?;
-					let mut ret = Box::new(ManagedPointer::new(sfs_init_check_null(&|| sqfs_dir_writer_create_inode(*self.dir_writer, 0, 0, node.parent), "Couldn't get inode for directory")?, libc_free));
+					let mut ret = Box::new(sfs_init_check_null(&|| {
+						sqfs_dir_writer_create_inode(*self.dir_writer, 0, 0, 0) // TODO Populate the parent inode number (how?)
+					}, "Couldn't get inode for directory", libc_free)?);
 					copy_metadata(&*node.inode, &mut ret);
 					node.inode = ret;
 				}
@@ -316,13 +338,12 @@ impl Writer {
 			sfs_check(sqfs_meta_writer_flush(*self.dirent_writer), "Couldn't flush directory entries")?;
 			self.superblock.directory_table_start = self.outfile_size();
 			sfs_check(sqfs_meta_write_write_to_file(*self.dirent_writer), "Couldn't write directory entries")?;
-			(self.superblock).inode_count = self.nodes.len() as u32;
+			self.superblock.inode_count = self.nodes.len() as u32;
 			sfs_check(sqfs_frag_table_write(*self.frag_table, *self.outfile, &mut self.superblock, *self.compressor), "Couldn't write fragment table")?;
 			sfs_check(sqfs_dir_writer_write_export_table(*self.dir_writer, *self.outfile, *self.compressor, self.nodes.len() as u32, root_ref, &mut self.superblock), "Couldn't write export table")?;
 			sfs_check(sqfs_id_table_write(*self.id_table, *self.outfile, &mut self.superblock, *self.compressor), "Couldn't write ID table")?;
 			sfs_check(sqfs_xattr_writer_flush(*self.xattr_writer, *self.outfile, &mut self.superblock, *self.compressor), "Couldn't write xattr table")?;
 			self.superblock.bytes_used = self.outfile_size();
-			self.superblock.modification_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
 			sfs_check(sqfs_super_write(&self.superblock, *self.outfile), "Couldn't rewrite archive superblock")?;
 			let padding: Vec<u8> = vec![0; PAD_TO - self.outfile_size() as usize % PAD_TO];
 			sfs_check((**self.outfile).write_at.expect("File does not provide write_at")(*self.outfile, self.outfile_size(), &padding as &[u8] as *const [u8] as *const libc::c_void, padding.len() as u64), "Couldn't pad file");
@@ -330,13 +351,13 @@ impl Writer {
 		Ok(())
 	}
 
-	pub fn add_tree<T: AsRef<Path>>(&mut self, root: T, callback: &Fn(Source) -> Result<Source>) -> Result<()> {
+	/*pub fn add_tree<P: AsRef<Path>>(&mut self, root: P, callback: &mut FnMut(SourceFile) -> std::result::Result<Vec<SourceFile>, BoxedError>) -> Result<()> {
 		let mut childmap: HashMap<PathBuf, BTreeMap<OsString, u32>> = HashMap::new();
 		for step in WalkDir::new(root.as_ref()).follow_links(false).contents_first(true) {
 			match step {
 				Ok(entry) => {
 					// TODO Consider adding Unix-specific functionality with graceful degradation
-					// TODO Catch all errors except add() and continue
+					// TODO Catch all errors except from add() and continue
 					let metadata = entry.metadata().unwrap();
 					let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
 					let data = if metadata.file_type().is_dir() {
@@ -349,13 +370,29 @@ impl Writer {
 						SourceData::Symlink(std::fs::read_link(entry.path())?.into_os_string())
 					}
 					else {
-						panic!("Unknown or unsupported file type"); // TODO Error
+						Err(SquashfsError::WriteType(metadata.file_type()))?;
+						unreachable!();
 					};
-					let id = self.add(callback(Source { data: data, xattrs: HashMap::new(), uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 })?)?;
-					if let Some(parent) = entry.path().parent() {
-						childmap.entry(parent.to_path_buf()).or_insert(BTreeMap::new()).insert(entry.file_name().to_os_string(), id);
+					let candidate = if cfg!(linux) {
+						use std::os::linux::fs::MetadataExt;
+						Source { data: data, xattrs: file_xattrs(entry.path())?, uid: metadata.st_uid(), gid: metadata.st_gid(), mode: (metadata.st_mode() & !S_IFMT) as u16, modified: mtime, flags: 0 }
 					}
-					println!("{}: {}", id, entry.path().display());
+					else {
+						Source { data: data, xattrs: HashMap::new(), uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 }
+					};
+					let candidate_file = SourceFile { path: entry.path().to_path_buf(), content: candidate };
+					for mut result in callback(candidate_file).map_err(|e| SquashfsError::WrappedError(e))? {
+						if let SourceData::Dir(children) = &mut result.content.data {
+							let mut new_children = childmap.remove(&result.path).unwrap_or(BTreeMap::new());
+							new_children.extend(children);
+							result.content.data = SourceData::Dir(Box::new(new_children.into_iter()));
+						}
+						let id = self.add(result.content)?;
+						if let Some(parent) = result.path.parent() {
+							childmap.entry(parent.to_path_buf()).or_insert(BTreeMap::new()).insert(result.path.file_name().unwrap().to_os_string(), id);
+						}
+						println!("{}: {}", id, result.path.display());
+					}
 				},
 				Err(e) => {
 					let path = e.path().map(|x| x.to_string_lossy().into_owned()).unwrap_or("(unknown)".to_string());
@@ -364,5 +401,93 @@ impl Writer {
 			}
 		}
 		Ok(())
+	}*/
+}
+
+pub struct TreeProcessor {
+	root: PathBuf,
+	writer: RefCell<Writer>,
+	childmap: RefCell<HashMap<PathBuf, BTreeMap<OsString, u32>>>,
+}
+
+impl TreeProcessor {
+	pub fn new<P: AsRef<Path>>(writer: Writer, root: P) -> Result<Self> {
+		Ok(Self { root: root.as_ref().to_path_buf(), writer: RefCell::new(writer), childmap: RefCell::new(HashMap::new()) })
+	}
+
+	pub fn add(&self, mut source: SourceFile) -> Result<u32> {
+		let mut childmap = self.childmap.borrow_mut();
+		if let SourceData::Dir(children) = &mut source.content.data {
+			// Pull in any last-minute additions made by the user
+			let mut new_children = childmap.remove(&source.path).unwrap_or(BTreeMap::new());
+			new_children.extend(children);
+			source.content.data = SourceData::Dir(Box::new(new_children.into_iter()));
+		}
+		let id = self.writer.borrow_mut().add(source.content)?;
+		if let Some(parent) = source.path.parent() {
+			childmap.entry(parent.to_path_buf()).or_insert(BTreeMap::new()).insert(source.path.file_name().expect("Path from walkdir has no file name").to_os_string(), id);
+		}
+		Ok(id)
+	}
+
+	pub fn finish(&self) -> Result<()> {
+		self.writer.borrow_mut().finish()
+	}
+
+	fn make_source(&self, entry: DirEntry) -> Result<Source> {
+		// TODO Consider adding Unix-specific functionality with graceful degradation
+		// TODO Catch all errors except add() and continue
+		let metadata = entry.metadata().unwrap();
+		let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
+		let data = if metadata.file_type().is_dir() {
+			SourceData::Dir(Box::new(self.childmap.borrow_mut().remove(&entry.path().to_path_buf()).unwrap_or(BTreeMap::new()).into_iter()))
+		}
+		else if metadata.file_type().is_file() {
+			SourceData::File(Box::new(std::fs::File::open(entry.path())?))
+		}
+		else if metadata.file_type().is_symlink() {
+			SourceData::Symlink(std::fs::read_link(entry.path())?.into_os_string())
+		}
+		else {
+			Err(SquashfsError::WriteType(metadata.file_type()))?;
+			unreachable!();
+		};
+		let source = if cfg!(linux) {
+			use std::os::linux::fs::MetadataExt;
+			Source { data: data, xattrs: file_xattrs(entry.path())?, uid: metadata.st_uid(), gid: metadata.st_gid(), mode: (metadata.st_mode() & !S_IFMT) as u16, modified: mtime, flags: 0 }
+		}
+		else {
+			Source { data: data, xattrs: HashMap::new(), uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 }
+		};
+		Ok(source)
+	}
+
+	pub fn iter<'a>(&'a self) -> TreeIterator<'a> {
+		let tree = WalkDir::new(&self.root).follow_links(false).contents_first(true);
+		TreeIterator { processor: self, tree: tree.into_iter() }
+	}
+}
+
+pub struct TreeIterator<'a> {
+	processor: &'a TreeProcessor,
+	tree: walkdir::IntoIter,
+}
+
+impl<'a> std::iter::Iterator for TreeIterator<'a> {
+	type Item = Result<SourceFile>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self.tree.next() {
+			None => None,
+			Some(Ok(entry)) => {
+				let path = entry.path().to_path_buf();
+				Some(self.processor.make_source(entry).map(|source| SourceFile { path: path, content: source }))
+			}
+			Some(Err(e)) => {
+				let path = e.path().map(|x| x.to_string_lossy().into_owned()).unwrap_or("(unknown)".to_string());
+				eprintln!("Not processing {}: {}", path, e.to_string());
+				self.next()
+			}
+		}
 	}
 }
