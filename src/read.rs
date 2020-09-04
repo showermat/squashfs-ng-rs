@@ -546,15 +546,15 @@ impl Archive {
 		enoent_ok(self.get_exists(path))
 	}
 
-	pub fn get_id(&self, id: u64) -> Result<Node> { // TODO Return Result<Option<Node>> here as well
+	pub fn get_id(&self, id: u64) -> Result<Node> {
 		if self.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_EXPORTABLE as u16 == 0 { Err(SquashfsError::Unsupported("inode indexing".to_string()))?; }
 		if id <= 0 || id > self.superblock.inode_count as u64 { Err(SquashfsError::Range(id, self.superblock.inode_count as u64))? }
 		let compressor = self.compressor()?;
 		let export_reader = self.meta_reader(&compressor, None)?; // TODO Would be nice if we could set bounds for this
-		let (block, offset) = ((id - 1) * 8 / self.superblock.block_size as u64, (id - 1) * 8 % self.superblock.block_size as u64);
+		let (block, offset) = ((id - 1) / 1024, (id - 1) % 1024 * 8);
 		let block_start: u64 = sfs_init(&|x| unsafe {
 			let read_at = (**self.file).read_at.expect("File object does not implement read_at");
-			read_at(*self.file, self.superblock.export_table_start + block, x as *mut libc::c_void, 8)
+			read_at(*self.file, self.superblock.export_table_start + block * 8, x as *mut libc::c_void, 8)
 		}, "Couldn't read inode table")?;
 
 		let mut noderef: u64 = 0;
@@ -573,22 +573,6 @@ impl Archive {
 		let map = &self.mmap.1;
 		unsafe { std::slice::from_raw_parts(map.data().offset(start as isize), len) }
 	}
-
-	/*pub fn names_from_dirent_refs(&mut self, dirent_refs: &[u64]) -> Result<Vec<String>> {
-		let compressor = self.compressor()?;
-		let meta_reader = self.meta_reader(&compressor, None)?; // TODO Set bounds
-		let mut ret = Vec::with_capacity(dirent_refs.len());
-		for dirent_ref in dirent_refs {
-			let (block, offset) = unpack_meta_ref(*dirent_ref);
-			unsafe { sfs_check(sqfs_meta_reader_seek(*meta_reader, block, offset), "Couldn't seek to directory entry")?; }
-			let entry = sfs_init_ptr(&|x| unsafe {
-				sqfs_meta_reader_read_dir_ent(*meta_reader, x)
-			}, "Couldn't read directory entry by reference", libc_free)?;
-			let name_bytes = unsafe { (**entry).name.as_slice((**entry).size as usize + 1) };
-			ret.push(String::from_utf8(name_bytes.to_vec())?);
-		}
-		Ok(ret)
-	}*/
 }
 
 unsafe impl Send for Archive { }

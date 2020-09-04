@@ -350,58 +350,6 @@ impl Writer {
 		}
 		Ok(())
 	}
-
-	/*pub fn add_tree<P: AsRef<Path>>(&mut self, root: P, callback: &mut FnMut(SourceFile) -> std::result::Result<Vec<SourceFile>, BoxedError>) -> Result<()> {
-		let mut childmap: HashMap<PathBuf, BTreeMap<OsString, u32>> = HashMap::new();
-		for step in WalkDir::new(root.as_ref()).follow_links(false).contents_first(true) {
-			match step {
-				Ok(entry) => {
-					// TODO Consider adding Unix-specific functionality with graceful degradation
-					// TODO Catch all errors except from add() and continue
-					let metadata = entry.metadata().unwrap();
-					let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
-					let data = if metadata.file_type().is_dir() {
-						SourceData::Dir(Box::new(childmap.remove(&entry.path().to_path_buf()).unwrap_or(BTreeMap::new()).into_iter()))
-					}
-					else if metadata.file_type().is_file() {
-						SourceData::File(Box::new(std::fs::File::open(entry.path())?))
-					}
-					else if metadata.file_type().is_symlink() {
-						SourceData::Symlink(std::fs::read_link(entry.path())?.into_os_string())
-					}
-					else {
-						Err(SquashfsError::WriteType(metadata.file_type()))?;
-						unreachable!();
-					};
-					let candidate = if cfg!(linux) {
-						use std::os::linux::fs::MetadataExt;
-						Source { data: data, xattrs: file_xattrs(entry.path())?, uid: metadata.st_uid(), gid: metadata.st_gid(), mode: (metadata.st_mode() & !S_IFMT) as u16, modified: mtime, flags: 0 }
-					}
-					else {
-						Source { data: data, xattrs: HashMap::new(), uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 }
-					};
-					let candidate_file = SourceFile { path: entry.path().to_path_buf(), content: candidate };
-					for mut result in callback(candidate_file).map_err(|e| SquashfsError::WrappedError(e))? {
-						if let SourceData::Dir(children) = &mut result.content.data {
-							let mut new_children = childmap.remove(&result.path).unwrap_or(BTreeMap::new());
-							new_children.extend(children);
-							result.content.data = SourceData::Dir(Box::new(new_children.into_iter()));
-						}
-						let id = self.add(result.content)?;
-						if let Some(parent) = result.path.parent() {
-							childmap.entry(parent.to_path_buf()).or_insert(BTreeMap::new()).insert(result.path.file_name().unwrap().to_os_string(), id);
-						}
-						println!("{}: {}", id, result.path.display());
-					}
-				},
-				Err(e) => {
-					let path = e.path().map(|x| x.to_string_lossy().into_owned()).unwrap_or("(unknown)".to_string());
-					eprintln!("Not processing {}: {}", path, e.to_string());
-				}
-			}
-		}
-		Ok(())
-	}*/
 }
 
 pub struct TreeProcessor {
