@@ -1,22 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString};
 use std::io;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf, Component};
-use std::os::unix::io::AsRawFd; // TODO Is there a way to mmap cross-platform?
 use std::sync::{Arc, Mutex};
-use bindings::*;
 use super::*;
-use mmap::{MemoryMap, MapOption};
+use memmap::{Mmap, MmapOptions};
 use owning_ref::OwningHandle;
-use thiserror::Error;
 
 // Canonicalize without requiring the path to actually exist in the filesystem
 fn dumb_canonicalize(path: &Path) -> PathBuf {
 	let mut ret = PathBuf::new();
 	for part in path.components() {
 		match part {
-			Component::Prefix(_) => panic!("What is this, Windows?"), // TODO
+			Component::Prefix(_) => (),
 			Component::CurDir => (),
 			Component::RootDir => ret.clear(),
 			Component::ParentDir => { ret.pop(); },
@@ -56,38 +53,41 @@ impl<'a> Dir<'a> {
 		unsafe { sqfs_dir_reader_rewind(**self.reader.lock().expect(LOCK_ERR)); }
 	}
 
-	fn read<'b>(&'b self) -> Result<Node<'a>> {
+	fn read<'b>(&'b self) -> Result<Option<Node<'a>>> {
 		let locked_reader = self.reader.lock().expect(LOCK_ERR);
-		let entry = sfs_init_ptr(&|x| unsafe {
-			sqfs_dir_reader_read(**locked_reader, x)
-		}, "Couldn't read directory entries", libc_free)?;
-		let name_bytes = unsafe { (**entry).name.as_slice((**entry).size as usize + 1) };
-		let name = String::from_utf8(name_bytes.to_vec())?;
-		let node = sfs_init_ptr(&|x| unsafe {
-			sqfs_dir_reader_get_inode(**locked_reader, x)
-		}, "Couldn't read directory entry inode", libc_free)?;
-		Node::new(self.node.container, node, self.node.path.as_ref().map(|path| path.join(name)))
+		let mut raw_entry: *mut sqfs_dir_entry_t = ptr::null_mut();
+		if sfs_check(unsafe { sqfs_dir_reader_read(**locked_reader, &mut raw_entry) }, "Couldn't read directory entries")? > 0 { Ok(None) }
+		else if raw_entry.is_null() { Err(SquashfsError::LibraryReturnError("Couldn't read directory entries".to_string()))? }
+		else {
+			let entry = ManagedPointer::new(raw_entry, libc_free);
+			let name_bytes = unsafe { (**entry).name.as_slice((**entry).size as usize + 1) };
+			let name = String::from_utf8(name_bytes.to_vec())?;
+			let node = sfs_init_ptr(&|x| unsafe {
+				sqfs_dir_reader_get_inode(**locked_reader, x)
+			}, "Couldn't read directory entry inode", libc_free)?;
+			Ok(Some(Node::new(self.node.container, node, self.node.path.as_ref().map(|path| path.join(name)))?))
+		}
 	}
 
 	pub fn child(&self, name: &str) -> Result<Option<Node>> {
 		match unsafe { enoent_ok(sfs_check(sqfs_dir_reader_find(**self.reader.lock().expect(LOCK_ERR), CString::new(name)?.as_ptr()), &format!("Couldn't find child \"{}\"", name)))? } {
 			None => Ok(None),
-			Some(_) => Ok(Some(self.read()?)),
+			Some(_) => Ok(self.read()?),
 		}
 	}
 }
 
 impl<'a> std::iter::Iterator for Dir<'a> {
-	type Item = Node<'a>;
+	type Item = Result<Node<'a>>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		self.read().ok()
+		self.read().transpose()
 	}
 }
 
 pub struct File<'a> {
 	node: &'a Node<'a>,
-	compressor: ManagedPointer<sqfs_compressor_t>,
+	#[allow(dead_code)] compressor: ManagedPointer<sqfs_compressor_t>, // Referenced by `reader`
 	reader: Mutex<ManagedPointer<sqfs_data_reader_t>>,
 	offset: Mutex<u64>,
 }
@@ -129,7 +129,7 @@ impl<'a> File<'a> {
 				_ => panic!("File is not a file")
 			}
 		};
-		let block_count = unsafe { inode.payload_bytes_used / std::mem::size_of::<sqfs_u32>() as u32 };
+		let block_count = inode.payload_bytes_used / std::mem::size_of::<sqfs_u32>() as u32;
 		if block_count == 0 || frag_idx != 0xffffffff { return None; }
 		let block_sizes = unsafe { inode.extra.as_slice(block_count as usize) };
 		if block_sizes.iter().any(|x| x & 0x01000000 == 0) { return None; }
@@ -225,7 +225,7 @@ impl<'a> Data<'a> {
 		}
 	}
 	
-	fn name(&self) -> String {
+	pub fn name(&self) -> String {
 		match self {
 			Data::File(_) => "regular file",
 			Data::Dir(_) => "directory",
@@ -281,7 +281,7 @@ pub struct OwnedDir<'a> {
 }
 
 impl<'a> std::iter::Iterator for OwnedDir<'a> {
-	type Item = Node<'a>;
+	type Item = Result<Node<'a>>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		(*self.handle).next()
@@ -315,6 +315,11 @@ impl<'a> Node<'a> {
 
 	pub fn xattrs(&self, category: XattrType) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
 		if self.container.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_NO_XATTRS as u16 != 0 { Ok(HashMap::new()) }
+		// TODO The following line reflects what I think is a bug.  I have a non-xattr archive
+		// created by mksquashfs, which does not have the above flag set but has the below table
+		// offset of -1.  This workaround allows us to check both cases until I get around to
+		// figuring out what's going on.
+		else if self.container.superblock.xattr_id_table_start == 0xffffffffffffffff { Ok(HashMap::new()) }
 		else {
 			let compressor = self.container.compressor()?;
 			let xattr_reader = sfs_init_check_null(&|| unsafe {
@@ -378,7 +383,7 @@ impl<'a> Node<'a> {
 		}).ok_or(SquashfsError::NoPath)?
 	}
 
-	pub fn resolve(&self) -> Result<Self> {
+	pub fn resolve_exists(&self) -> Result<Self> {
 		let mut visited = HashSet::new();
 		let mut cur = Box::new(self.clone());
 		let mut i = 0;
@@ -405,16 +410,34 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	pub fn resolve(&self) -> Result<Option<Self>> {
+		enoent_ok(self.resolve_exists())
+	}
+
+	pub fn is_file(&self) -> Result<bool> {
+		match self.data()? {
+			Data::File(_) => Ok(true),
+			_ => Ok(false),
+		}
+	}
+
 	pub fn as_file(&self) -> Result<File> {
 		match self.data()? {
 			Data::File(f) => Ok(f),
 			other => Err(SquashfsError::WrongType(self.path_string(), other.name(), "regular file".to_string())),
 		}
 	}
-
+	
 	pub fn into_owned_file(self) -> Result<OwnedFile<'a>> {
-		let resolved = self.resolve()?;
+		let resolved = self.resolve_exists()?;
 		Ok(OwnedFile { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_file().map(|x| Box::new(x)) })? })
+	}
+
+	pub fn is_dir(&self) -> Result<bool> {
+		match self.data()? {
+			Data::Dir(_) => Ok(true),
+			_ => Ok(false),
+		}
 	}
 
 	pub fn as_dir(&self) -> Result<Dir> {
@@ -425,7 +448,7 @@ impl<'a> Node<'a> {
 	}
 
 	pub fn into_owned_dir(self) -> Result<OwnedDir<'a>> {
-		let resolved = self.resolve()?;
+		let resolved = self.resolve_exists()?;
 		Ok(OwnedDir { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_dir().map(|x| Box::new(x)) })? })
 	}
 
@@ -472,7 +495,7 @@ pub struct Archive {
 	file: ManagedPointer<sqfs_file_t>,
 	superblock: sqfs_super_t,
 	compressor_config: sqfs_compressor_config_t,
-	mmap: (std::fs::File, MemoryMap),
+	mmap: (std::fs::File, Mmap),
 }
 
 impl Archive {
@@ -488,9 +511,11 @@ impl Archive {
 			sqfs_compressor_config_init(x, superblock.compression_id as u32, superblock.block_size as u64, SQFS_COMP_FLAG_SQFS_COMP_FLAG_UNCOMPRESS as u16)
 		}, "Couldn't read archive compressor config")?;
 		let os_file = std::fs::File::open(&path)?;
-		let map = MemoryMap::new(superblock.bytes_used as usize, &vec![MapOption::MapReadable, MapOption::MapFd(os_file.as_raw_fd())])?;
+		let map = unsafe { MmapOptions::new().map(&os_file).map_err(|e| SquashfsError::Mmap(e))? };
+		//let map = MemoryMap::new(superblock.bytes_used as usize, &vec![MapOption::MapReadable, MapOption::MapFd(os_file.as_raw_fd())])?;
 		Ok(Self { path: path.as_ref().to_path_buf(), file: file, superblock: superblock, compressor_config: compressor_config, mmap: (os_file, map) })
 	}
+
 
 	fn compressor(&self) -> Result<ManagedPointer<sqfs_compressor_t>> {
 		Ok(sfs_init_ptr(&|x| unsafe {
@@ -506,8 +531,7 @@ impl Archive {
 	}
 
 	fn id_lookup(&self, idx: u16) -> Result<u32> {
-		// TODO Consider chaching the ID table to make lookups more efficient
-		let mut id_table = sfs_init_check_null(&|| unsafe {
+		let id_table = sfs_init_check_null(&|| unsafe {
 			sqfs_id_table_create(0)
 		}, "Couldn't create ID table", sfs_destroy)?;
 		let compressor = self.compressor()?;
@@ -515,6 +539,10 @@ impl Archive {
 		Ok(sfs_init(&|x| unsafe {
 			sqfs_id_table_index_to_id(*id_table, idx, x)
 		}, "Couldn't get ID from ID table")?)
+	}
+
+	pub fn path(&self) -> &Path {
+		&self.path
 	}
 
 	pub fn size(&self) -> u32 {
@@ -550,7 +578,7 @@ impl Archive {
 		if self.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_EXPORTABLE as u16 == 0 { Err(SquashfsError::Unsupported("inode indexing".to_string()))?; }
 		if id <= 0 || id > self.superblock.inode_count as u64 { Err(SquashfsError::Range(id, self.superblock.inode_count as u64))? }
 		let compressor = self.compressor()?;
-		let export_reader = self.meta_reader(&compressor, None)?; // TODO Would be nice if we could set bounds for this
+		let export_reader = self.meta_reader(&compressor, None)?; // Would be nice if we could set bounds for this
 		let (block, offset) = ((id - 1) / 1024, (id - 1) % 1024 * 8);
 		let block_start: u64 = sfs_init(&|x| unsafe {
 			let read_at = (**self.file).read_at.expect("File object does not implement read_at");
@@ -570,8 +598,7 @@ impl Archive {
 	}
 
 	fn map_range(&self, start: usize, len: usize) -> &[u8] {
-		let map = &self.mmap.1;
-		unsafe { std::slice::from_raw_parts(map.data().offset(start as isize), len) }
+		&(self.mmap.1)[start..start + len]
 	}
 }
 

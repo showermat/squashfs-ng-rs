@@ -1,6 +1,6 @@
 #[macro_use] extern crate lazy_static;
 extern crate libc;
-extern crate mmap;
+extern crate memmap;
 extern crate num_derive;
 extern crate num_traits;
 extern crate owning_ref;
@@ -62,18 +62,21 @@ pub enum SquashfsError {
 	#[error("{0}")] LibraryNullError(String),
 	#[error("Symbolic link chain exceeds {0} elements")] LinkChain(i32), // Can I use a const in the formatting string?
 	#[error("Symbolic link loop detected containing {0}")] LinkLoop(PathBuf),
+	#[error("Dangling symbolic link from {0} to {1}")] DanglingLink(PathBuf, PathBuf),
 	#[error("{0} is type {1}, not {2}")] WrongType(String, String, String),
 	#[error("Tried to copy an object that can't be copied")] Copy,
 	#[error("Tried to get parent of a node with an unknown path")] NoPath,
 	#[error("Inode index {0} is not within limits 1..{1}")] Range(u64, u64),
 	#[error("Couldn't read file: {0}")] Read(#[from] std::io::Error),
 	#[error("The filesystem does not support the feature: {0}")] Unsupported(String),
-	#[error("Memory mapping failed: {0}")] Mmap(#[from] mmap::MapError),
+	#[error("Memory mapping failed: {0}")] Mmap(std::io::Error),
 	#[error("Couldn't get the current system time: {0}")] Time(#[from] std::time::SystemTimeError),
 	#[error("Refusing to create empty archive")] Empty,
 	#[error("Tried to write directory {0} before child {1}")] WriteOrder(u32, u32),
 	#[error("Tried to write unknown or unsupported file type")] WriteType(std::fs::FileType),
 	#[error("Callback returned an error")] WrappedError(BoxedError),
+	#[error("Failed to retrieve xattrs for {0}: {1}")] Xattr(PathBuf, std::io::Error),
+	#[error("Tried to add files to a writer that was already finished")] Finished,
 }
 
 type Result<T> = std::result::Result<T, SquashfsError>;
