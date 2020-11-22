@@ -1,3 +1,26 @@
+//! Facilities for writing SquashFS archives.
+//!
+//! The most straightforward way to write a SquashFS file from a directory tree on-disk is to use a
+//! [`TreeProcessor`].  This provides the ability to make "last-minute" modifications to the files
+//! that are added, such as skipping certain files or modifying metadata.
+//!
+//! To create a totally "synthetic" SquashFS file that is not built from files in a filesystem,
+//! open a [`Writer`] and feed [`Source`]s to it.
+//!
+//! # Limitations
+//!
+//! This library does not yet handle hard links; files with multiple hard links will be archived as
+//! separate files with identical contents (which should be deduplicated and end up taking up
+//! little additional space).
+//!
+//! The SquashFS specification includes a field in directory inodes for the parent inode number,
+//! presumably to make `..` directory entries work.  This is one factor that makes it impossible to
+//! build a SquashFS file without building out the entire directory tree to be archived in memory.
+//! I have tried as hard as poassible to reduce the amount of data that must be stored for each
+//! node added, and this architecture makes it infeasible to store parent inodes in directory
+//! entries.  I hope to fix this some day, and in the meantime it has not caused problems in the
+//! ways I have used the resultant files.
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsString};
@@ -9,33 +32,126 @@ use super::*;
 use super::SquashfsError;
 use walkdir::{DirEntry, WalkDir};
 
+/// Flags to fine-tune how an entry is added to the archive.
+///
+/// These valued can be ORed together and passed in the [`flags`](Source::flags) field of a
+/// [`Source`] object.
 #[repr(u32)]
 pub enum BlockFlags {
+	/// Don't compress file data.
+	///
+	/// By default, files are compressed, and the compressed version is stored in the archive if it
+	/// is smaller than the uncompressed version.  Setting this flag will force the file to be
+	/// stored uncompressed.
 	DontCompress = super::SQFS_BLK_FLAGS_SQFS_BLK_DONT_COMPRESS,
+
+	/// Align the file data to device blocks.
+	///
+	/// If set, padding will be added before and after this file's data blocks so that it is
+	/// aligned to the blocks of the underlying disk.
 	BlockAlign = super::SQFS_BLK_FLAGS_SQFS_BLK_ALIGN,
+
+	/// Store the tail of the file in a regular data block rather than a fragment block.
+	///
+	/// The compressed content of a file to be written to an archive is split into equally-sized
+	/// blocks and stored as "data blocks".  The final chunk is usually smaller than the rest, so
+	/// these final chunks are collected from multiple files are collected and stored together in
+	/// separate "fragment blocks" as an optimization.  If there is a reason for the entire file's
+	/// contents to be stored together, fragmentation can be disabled using this flag.
 	DontFragment = super::SQFS_BLK_FLAGS_SQFS_BLK_DONT_FRAGMENT,
+
+	/// Don't deduplicated data blocks for this file.
+	///
+	/// If two files contain an identical data block, the block will be stored only once and both
+	/// files' block indices will point to this single block.  The user can force all blocks of a
+	/// file to be stored by setting this flag.
 	DontDeduplicate = super::SQFS_BLK_FLAGS_SQFS_BLK_DONT_DEDUPLICATE,
+
+	/// Don't elide sparse blocks.
+	///
+	/// If a block of a file contains only zeros, it will not be stored at all and the file's block
+	/// index will mark that the block is all-zero.  This behavior can be disabled so that a zero
+	/// block will be written by setting this flag.
 	IgnoreSparse = super::SQFS_BLK_FLAGS_SQFS_BLK_IGNORE_SPARSE,
+
+	/// Don't compute block checksums for this file.
+	///
+	/// Each data block is checksummed to verify data integrity unless this flag is set.
 	DontHash = super::SQFS_BLK_FLAGS_SQFS_BLK_DONT_HASH,
 }
 
+/// Represents the data of a filesystem object that can be added to an archive.
+///
+/// When creating the archive, this object is read from a [`Source`] (which additionally describes
+/// the filesystem attributes of the node) and used to set the type and contents of the node.
 pub enum SourceData {
+	/// Create a file with the provided contents.
+	///
+	/// The contained object will be read and its contents placed in the file written to the
+	/// archive.
 	File(Box<dyn Read + Sync + Send>),
+
+	/// Create a directory with the given chidren.
+	///
+	/// The creator must provide an iterator over [`OsString`] and `u32`, which respectively
+	/// represent the name and inode number of each child of this directory.  This is one of the
+	/// hardest parts about writing archive contents -- all children of each directory must be
+	/// written before the directory itself, so that the inode numbers of the children are known.
+	/// [`TreeProcessor`] facilitates this by performing a post-order traversal of a filesystem,
+	/// ensuring that files are written in the correct order.
 	Dir(Box<dyn Iterator<Item=(OsString, u32)> + Sync + Send>),
-	Symlink(OsString),
+
+	/// Create a symbolic link to the given path.
+	///
+	/// It is not required for the target of the symlink to exist.
+	Symlink(PathBuf),
+
+	/// Create a block device file with the given major and minor device numbers.
 	BlockDev(u32, u32),
+
+	/// Create a character device file with the given major and minor device numbers.
 	CharDev(u32, u32),
+
+	/// Create a named pipe.
 	Fifo,
+
+	/// Create a socket.
 	Socket,
 }
 
+/// A single node to be added to the SquashFS archive.
+///
+/// This contains a [`SourceData`] instance containing the actual data of the node, along with
+/// metadata such as permissions and extended attributes.  The path to the node is not part of this
+/// object, because all information necessary to reconstruct the directory tree is contained in the
+/// directory iterators.  However, for higher-level mechanisms that abstract away details such as
+/// inode numbers, it is helpful to associate a path with each `Source`; [`SourceFile`] is used for
+/// this purpose.
+///
+/// This object is designed to be constructed by the user by setting all fields to the appropriate
+/// values.
 pub struct Source {
+	/// The type of the node and the data it contains.
 	pub data: SourceData,
+
+	/// The UID of the file.
 	pub uid: u32,
+
+	/// The GID of the file.
 	pub gid: u32,
+
+	/// The file mode.
 	pub mode: u16,
+
+	/// The modification time of the file as a Unix timestamp.
 	pub modified: u32,
+
+	/// Extended attributes on the node.  Each one must start with a valid xattr namespace (such as
+	/// "user.", and the values can be arbitrary byte strings.
 	pub xattrs: HashMap<OsString, Vec<u8>>,
+
+	/// [`BlockFlags`] to set on the node to control how its contents are archived.  Multiple flags
+	/// can be combined using `|`.
 	pub flags: u32,
 }
 
@@ -63,6 +179,7 @@ fn copy_metadata(src: &ManagedPointer<sqfs_inode_generic_t>, dst: &mut ManagedPo
 }
 
 impl Source {
+	/// Construct a `Source` from a `SourceData`, using defaults for all metadata fields.
 	pub fn defaults(data: SourceData) -> Self {
 		Self { data: data, uid: 0, gid: 0, mode: 0x1ff, modified: 0, xattrs: HashMap::new(), flags: 0 }
 	}
@@ -71,7 +188,6 @@ impl Source {
 		((min & 0xfff00) << 20) | ((maj & 0xfff) << 8) | (min & 0xff)
 	}
 
-	// TODO Handle hard links
 	unsafe fn to_inode(&self, link_count: u32) -> Result<ManagedPointer<sqfs_inode_generic_t>> {
 		unsafe fn create_inode(kind: SQFS_INODE_TYPE, extra: usize) -> ManagedPointer<sqfs_inode_generic_t> {
 			use std::alloc::{alloc, Layout};
@@ -89,7 +205,7 @@ impl Source {
 				ret
 			},
 			SourceData::Symlink(dest_os) => {
-				let dest = os_to_string(&dest_os)?.into_bytes();
+				let dest = os_to_string(dest_os.as_os_str())?.into_bytes();
 				let mut ret = create_inode(SQFS_INODE_TYPE_SQFS_INODE_SLINK, dest.len());
 				let mut data = &mut (**ret).data.slink;
 				data.nlink = link_count;
@@ -133,11 +249,51 @@ struct IntermediateNode {
 	pos: u64,
 }
 
+/// A [`Source`] bundled with the path where it should be located.
+///
+/// While the path of a `Source` is not strictly necessary to build the directory tree, it is a
+/// useful way for automatic archive builders like [`TreeProcessor`] to keep track of files as they
+/// are being added.
+///
+/// For purposes for which the metadata stored in [`Source`], like permissions and xattrs, are
+/// unnecessary, [`defaults`](Self::defaults) can be used to conveniently construct a `FileSource`
+/// from a [`PathBuf`] and [`SourceData`].
 pub struct SourceFile {
 	pub path: PathBuf,
 	pub content: Source,
 }
 
+impl SourceFile {
+	/// Wrap a `SourceData` in a new `Source`, using defaults for all metadata fields.
+	///
+	/// This sets UID and GID to 0 and permissions to 0o777, gives a null modification time and no
+	/// xattrs, and sets no flags.
+	pub fn defaults(path: PathBuf, data: SourceData) -> Self {
+		Self { path: path, content: Source::defaults(data) }
+	}
+}
+
+/// A basic SquashFS writer.
+///
+/// This provides a simple interface for writing archives.  The user calls [`open`](Self::open),
+/// [`add`](Self::add) to add each node, and [`finish`](Self::finish) to finish writing.  This is
+/// intended for writing archives that are generated by code or otherwise not reflected by files in
+/// a file system -- if you want to archive a tree of files from disk, [`TreeProcessor`] handles
+/// directory tracking so that you don't have to do it yourself.
+///
+/// **Each node must be written before its parent**, and an error will be raised if this invariant
+/// is not maintained -- however, this is not detected until `finish` is called.
+///
+///     let writer = Writer::open("archive.sfs")?;
+///     let mut ids = HashMap::new();
+///     for i in 0..5 {
+///         let mut content = format!("This is the content of file {}.txt.", i).as_bytes();
+///         let source = Source::defaults(SourceData::File(Box::new(content)));
+///         let id = writer.add(source)?;
+///         ids.insert(OsString::from(format!("{}.txt", i)), id);
+///     }
+///     writer.add(Source::defaults(SourceData::Dir(Box::new(ids.into_iter()))))?;
+///     writer.finish()?;
 pub struct Writer {
 	outfile: ManagedPointer<sqfs_file_t>,
 	#[allow(dead_code)] compressor_config: sqfs_compressor_config_t, // Referenced by `compressor`
@@ -156,6 +312,9 @@ pub struct Writer {
 }
 
 impl Writer {
+	/// Open a new output file for writing.
+	///
+	/// If the file exists, it will be overwritten.
 	pub fn open<T: AsRef<Path>>(path: T) -> Result<Self> {
 		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
 		let block_size = SQFS_DEFAULT_BLOCK_SIZE as u64;
@@ -247,6 +406,16 @@ impl Writer {
 		unsafe { (**self.outfile).get_size.expect("Superblock doesn't provide get_size")(*self.outfile) }
 	}
 
+	/// Add the provided `Source` to the archive.
+	///
+	/// This writes file data and xattrs to the archive directly, while storing directory tree
+	/// information to write when `finish` is called.
+	///
+	/// The returned value is the inode number of the added `Source`.  If the file is to be added
+	/// to a directory (that is, almost always), this number needs to be stored so that it can be
+	/// provided when the directory is added.  In the current implementation, inode numbers start
+	/// at 1 for the first file and count steadily upward, but this behavior may change without
+	/// warning.
 	pub fn add(&mut self, mut source: Source) -> Result<u32> {
 		let finished = self.finished.read().expect("Poisoned lock");
 		if *finished { Err(SquashfsError::Finished)?; }
@@ -296,6 +465,9 @@ impl Writer {
 		Ok(nodes.len() as u32)
 	}
 
+	/// Finish writing the archive and flush all contents to disk.
+	///
+	/// It is an error to call `add` after this has been run.
 	pub fn finish(&mut self) -> Result<()> {
 		*self.finished.write().expect("Poisoned lock") = true;
 		let nodes = self.nodes.lock().expect("Poisoned lock");
@@ -351,17 +523,45 @@ impl Writer {
 unsafe impl Sync for Writer { }
 unsafe impl Send for Writer { }
 
+/// Tool to help create an archive from a directory in the filesystem.
+///
+/// This wraps a [`Writer`] and takes care of tracking the directory hierarchy as files are added,
+/// populating the iterators of [`SourceData::Dir`]s as necessary.
+///
+/// To simply create a SquashFS file from a chosen directory, call [`process`](Self::process):
+///
+///     TreeProcessor::new("archive.sfs")?.process("/home/me/test")?
+///
+/// For more control over the addition process -- for example, to exclude certain files, add
+/// extended attributes, ignore errors, or print files as they are added -- use
+/// [`iter`](Self::iter) to get an iterator over the directory tree, and then call
+/// [`add`](Self::add) on each `SourceFile` yielded after applying any desired transformations.
+/// After the iterator finishes, remember to call [`finish`](Self::finish).
+///
+///     let processor = TreeProcessor::new("archive.sfs")?;
+///     for mut entry in processor.iter("/home/me/test") {
+///         entry.content.mode = 0x1ff; // Set all nodes to be read/writable by anyone
+///         match processor.add(entry) {
+///             Ok(id) => println!("{}: {}", id, entry.path),
+///             Err(_) => println!("Failed adding {}", entry.path),
+///         }
+///     }
+///     processor.finish()?;
 pub struct TreeProcessor {
-	root: PathBuf,
 	writer: Mutex<Writer>,
 	childmap: Mutex<HashMap<PathBuf, BTreeMap<OsString, u32>>>,
 }
 
 impl TreeProcessor {
-	pub fn new<P: AsRef<Path>>(writer: Writer, root: P) -> Result<Self> {
-		Ok(Self { root: root.as_ref().to_path_buf(), writer: Mutex::new(writer), childmap: Mutex::new(HashMap::new()) })
+	/// Create a new `TreeProcessor` for an output file.
+	pub fn new<P: AsRef<Path>>(outfile: P) -> Result<Self> {
+		let writer = Writer::open(outfile)?;
+		Ok(Self { writer: Mutex::new(writer), childmap: Mutex::new(HashMap::new()) })
 	}
 
+	/// Add a new file to the archive.
+	///
+	/// It is not recommended to call this on `SourceFile`s that were not yielded by `iter`.
 	pub fn add(&self, mut source: SourceFile) -> Result<u32> {
 		let mut childmap = self.childmap.lock().expect("Poisoned lock");
 		if let SourceData::Dir(children) = &mut source.content.data {
@@ -377,6 +577,7 @@ impl TreeProcessor {
 		Ok(id)
 	}
 
+	/// Finish writing the archive.
 	pub fn finish(&self) -> Result<()> {
 		self.writer.lock().expect("Poisoned lock").finish()
 	}
@@ -391,7 +592,7 @@ impl TreeProcessor {
 			SourceData::File(Box::new(std::fs::File::open(entry.path())?))
 		}
 		else if metadata.file_type().is_symlink() {
-			SourceData::Symlink(std::fs::read_link(entry.path())?.into_os_string())
+			SourceData::Symlink(std::fs::read_link(entry.path())?)
 		}
 		else {
 			Err(SquashfsError::WriteType(metadata.file_type()))?;
@@ -411,12 +612,28 @@ impl TreeProcessor {
 		Ok(source)
 	}
 
-	pub fn iter<'a>(&'a self) -> TreeIterator<'a> {
-		let tree = WalkDir::new(&self.root).follow_links(false).contents_first(true);
+	/// Create an iterator over a directory tree, yielding them in a form suitable to pass to
+	/// `add`.
+	pub fn iter<'a, P: AsRef<Path>>(&'a self, root: P) -> TreeIterator<'a> {
+		let tree = WalkDir::new(root).follow_links(false).contents_first(true);
 		TreeIterator { processor: self, tree: tree.into_iter() }
+	}
+
+	/// Add an entire directory tree to the archive, then finish it.
+	///
+	/// This is the most basic, bare-bones way to create a full archive from an existing directory
+	/// tree.  This offers no way to customize the archive or handle errors gracefully.
+	pub fn process<P: AsRef<Path>>(self, root: P) -> Result<()> {
+		for entry in self.iter(root) { self.add(entry?)?; }
+		self.finish()?;
+		Ok(())
 	}
 }
 
+/// An iterator yielding the nodes in a directory tree in a way suitable for archiving.
+///
+/// This is created by a [`TreeProcessor`] and the items yielded are intended to be
+/// [`add`](TreeProcessor::add)ed to it.
 pub struct TreeIterator<'a> {
 	processor: &'a TreeProcessor,
 	tree: walkdir::IntoIter,

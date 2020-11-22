@@ -1,3 +1,25 @@
+//! This crate provides Rust bindings for the [squashfs-tools-ng][] library, providing support for
+//! SquashFS as an embeddable archive format without the need for kernel support.  It also tries to
+//! provide a level of safety and abstraction on top of the C library.  Cross-platform usability is a
+//! secondary goal.
+//!
+//! # Installation
+//!
+//! Currently, the underlying [squashfs-tools-ng][] library must be installed on the system both to
+//! build and to use this library.  The development headers (`/usr/include/sqfs/...`) are required
+//! to build, and the shared library (`/usr/lib/libsquashfs.so`) to run.  The project's GitHub page
+//! asserts that packages are available in many Linux distributions' repositories.
+//!
+//! Once the dependencies are in place, this should function like most other Rust libraries, and
+//! `cargo build` should suffice to build the library.
+//!
+//! # Usage
+//!
+//! The [`read`] and [`write`](module@write) modules below provide support for reading and writing
+//! SquashFS files, respectively.  Check them out for further documentation.
+//!
+//! [squashfs-tools-ng]: https://github.com/AgentD/squashfs-tools-ng/
+
 #[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate memmap;
@@ -11,7 +33,6 @@ use std::mem::MaybeUninit;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::ptr;
-use bindings::*;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use thiserror::Error;
@@ -24,33 +45,44 @@ mod bindings {
 	include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+use bindings::*;
+
 pub mod read;
 pub mod write;
 
 type BoxedError = Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>;
 
+/// Errors raised by the underlying library.
+///
+/// This error type reflects all errors raised by the squashfs-tools-ng library.  This should
+/// always be wrapped in a [`SquashfsError`] before being returned from any of the functions in
+/// this library.
 #[derive(Error, Debug, FromPrimitive)]
 #[repr(i32)]
 pub enum LibError {
-	#[error("Failed to allocate memory")] Alloc = -1,
-	#[error("Generic I/O failure occurred")] Io = -2,
-	#[error("Compressor failed to extract data")] Compressor = -3,
-	#[error("Internal error occurred")] Internal = -4,
-	#[error("Archive file appears to be corrupted")] Corrupted = -5,
-	#[error("Unsupported feature used")] Unsupported = -6,
-	#[error("Archive would overflow memory")] Overflow = -7,
-	#[error("Out-of-bounds access attempted")] OutOfBounds = -8,
-	#[error("Superblock magic number incorrect")] SuperMagic = -9,
-	#[error("Unsupported archive version")] SuperVersion = -10,
-	#[error("Archive block size is invalid")] SuperBlockSize = -11,
-	#[error("Not a directory")] NotDir = -12,
-	#[error("Path does not exist")] NoEntry = -13,
-	#[error("Hard link loop detected")] LinkLoop = -14,
-	#[error("Not a regular file")] NotFile = -15,
-	#[error("Invalid argument passed")] ArgInvalid = -16,
-	#[error("Library operations performed in incorrect order")] Sequence = -17,
+	#[error("Failed to allocate memory")] Alloc = SQFS_ERROR_SQFS_ERROR_ALLOC,
+	#[error("Generic I/O failure occurred")] Io = SQFS_ERROR_SQFS_ERROR_IO,
+	#[error("Compressor failed to extract data")] Compressor = SQFS_ERROR_SQFS_ERROR_COMPRESSOR,
+	#[error("Internal error occurred")] Internal = SQFS_ERROR_SQFS_ERROR_INTERNAL,
+	#[error("Archive file appears to be corrupted")] Corrupted = SQFS_ERROR_SQFS_ERROR_CORRUPTED,
+	#[error("Unsupported feature used")] Unsupported = SQFS_ERROR_SQFS_ERROR_UNSUPPORTED,
+	#[error("Archive would overflow memory")] Overflow = SQFS_ERROR_SQFS_ERROR_OVERFLOW,
+	#[error("Out-of-bounds access attempted")] OutOfBounds = SQFS_ERROR_SQFS_ERROR_OUT_OF_BOUNDS,
+	#[error("Superblock magic number incorrect")] SuperMagic = SQFS_ERROR_SFQS_ERROR_SUPER_MAGIC,
+	#[error("Unsupported archive version")] SuperVersion = SQFS_ERROR_SFQS_ERROR_SUPER_VERSION,
+	#[error("Archive block size is invalid")] SuperBlockSize = SQFS_ERROR_SQFS_ERROR_SUPER_BLOCK_SIZE,
+	#[error("Not a directory")] NotDir = SQFS_ERROR_SQFS_ERROR_NOT_DIR,
+	#[error("Path does not exist")] NoEntry = SQFS_ERROR_SQFS_ERROR_NO_ENTRY,
+	#[error("Hard link loop detected")] LinkLoop = SQFS_ERROR_SQFS_ERROR_LINK_LOOP,
+	#[error("Not a regular file")] NotFile = SQFS_ERROR_SQFS_ERROR_NOT_FILE,
+	#[error("Invalid argument passed")] ArgInvalid = SQFS_ERROR_SQFS_ERROR_ARG_INVALID,
+	#[error("Library operations performed in incorrect order")] Sequence = SQFS_ERROR_SQFS_ERROR_SEQUENCE,
 }
 
+/// Errors encountered while reading or writing an archive.
+///
+/// This wraps all errors that might be encountered by the library during its normal course of
+/// operation.
 #[derive(Error, Debug)]
 pub enum SquashfsError {
 	#[error("Input contains an invalid null character")] NullInput(#[from] std::ffi::NulError),
@@ -79,7 +111,8 @@ pub enum SquashfsError {
 	#[error("Tried to add files to a writer that was already finished")] Finished,
 }
 
-type Result<T> = std::result::Result<T, SquashfsError>;
+/// Result type returned by SquashFS library operations.
+pub type Result<T> = std::result::Result<T, SquashfsError>;
 
 fn sfs_check(code: i32, desc: &str) -> Result<i32> {
 	match code {

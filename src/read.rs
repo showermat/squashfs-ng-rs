@@ -1,3 +1,22 @@
+//! Facilities for reading SquashFS archives.
+//!
+//! The most common scenario for using this library is:
+//!
+//!  1. To open a SquashFS file, use [`Archive::new`].
+//!  2. Call [`get`](Archive::get) to retrieve a [`Node`] by its path.
+//!  3. Call [`data`](Node::data) to get a [`Data`] object containing the node's data.
+//!
+//! `Node` also provides methods for inspecting metadata, resolving symlinks, and conveniently
+//! converting to file and directory objects.
+//!
+//!     let archive = Archive::open("archive.sfs")?;
+//!     match archive.get("/etc/passwd")? {
+//!         None => println!("File not present"),
+//!         Some(node) => if let Data::File(file) = node.data()? {
+//!             println!("{}", file.to_string()?);
+//!         },
+//!     }
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::io;
@@ -32,6 +51,21 @@ fn enoent_ok<T>(t: Result<T>) -> Result<Option<T>> {
 	}
 }
 
+/// A directory in the archive.
+///
+/// Directory objects are obtained by calling the [`data`](Node::data) or [`as_dir`](Node::as_dir)
+/// method on a [`Node`] object.  `Dir` implements [`Iterator`](std::iter::Iterator), so all
+/// children can be retrieved just by iterating over the directory.  The iterator can be reset by
+/// calling [`reset`](Self::reset).  Individual children can also be retrieved by name using
+/// [`child`](Self::child).
+///
+///     let archive = Archive::new("archive.sfs")?;
+///     let node = archive.get("/my-dir")?.expect("/my-dir does not exist").resolve()?;
+///     let dir = node.as_dir()?;
+///     let child = dir.child("file.txt")?.expect("/my-dir/file.txt does not exist");
+///     for entry in dir {
+///         println!("{}", entry?.name().unwrap());
+///     }
 #[derive(Debug)]
 pub struct Dir<'a> {
 	node: &'a Node<'a>,
@@ -49,6 +83,10 @@ impl<'a> Dir<'a> {
 		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader) })
 	}
 
+	/// Reset the directory reader to the beginning of the directory.
+	///
+	/// If the directory has been partially or completely iterated through, this will put it back
+	/// to the beginning so that it can be read again.
 	pub fn reset(&mut self) {
 		unsafe { sqfs_dir_reader_rewind(**self.reader.lock().expect(LOCK_ERR)); }
 	}
@@ -69,6 +107,10 @@ impl<'a> Dir<'a> {
 		}
 	}
 
+	/// Select a child inside the directory by name.
+	///
+	/// This will return `Ok(None)` if the child does not exist, or an `Err` if the lookup could
+	/// not be performed.
 	pub fn child(&self, name: &str) -> Result<Option<Node>> {
 		match unsafe { enoent_ok(sfs_check(sqfs_dir_reader_find(**self.reader.lock().expect(LOCK_ERR), CString::new(name)?.as_ptr()), &format!("Couldn't find child \"{}\"", name)))? } {
 			None => Ok(None),
@@ -85,6 +127,22 @@ impl<'a> std::iter::Iterator for Dir<'a> {
 	}
 }
 
+/// A file in the archive.
+///
+/// `File` objects allow standard operations on file inodes in an archive.  `File` implements
+/// [`Read`] and [`Seek`], so anything that reads files using standard Rust semantics can interact
+/// natively with these files.  [`to_bytes`](Self::to_bytes) and [`to_string`](Self::to_string)
+/// offer convenience wrappers around this.  Files that were archived with compression and
+/// fragmentation disabled can also be [`mmap`](Self::mmap)ed and accessed as an ordinary byte
+/// array.
+///
+///     let archive = Archive::new("archive.sfs")?;
+///     let node = archive.get("/a/01.txt")?.unwrap().resolve()?;
+///     let file = node.as_file()?;
+///     // File can now be used like anything else that implements `Read` and `Seek`.
+///     let mut buf = [0; 10];
+///     file.seek(SeekFrom::End(-10))?;
+///     file.read(&mut buf)?;
 pub struct File<'a> {
 	node: &'a Node<'a>,
 	#[allow(dead_code)] compressor: ManagedPointer<sqfs_compressor_t>, // Referenced by `reader`
@@ -102,24 +160,42 @@ impl<'a> File<'a> {
 		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader), offset: Mutex::new(0) })
 	}
 
+	/// Retrieve the size of the file in bytes.
 	pub fn size(&self) -> u64 {
 		let mut ret: u64 = 0;
 		unsafe { sqfs_inode_get_file_size(self.node.inode.as_const(), &mut ret) };
 		ret
 	}
 
+	/// Retrieve the entire contents of the file in the form of a byte Vec.
 	pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
 		let mut ret = Vec::with_capacity(self.size() as usize);
 		self.read_to_end(&mut ret)?;
 		Ok(ret)
 	}
 
+	/// Retrieve the entire contents of the file in the form of a String.
+	///
+	/// This calls [`Read::read_to_string`] under the hood.  Consequently, a UTF-8 error
+	/// will be raised if the entire file is not valid UTF-8.
 	pub fn to_string(&mut self) -> Result<String> {
 		let mut ret = String::with_capacity(self.size() as usize);
 		self.read_to_string(&mut ret)?;
 		Ok(ret)
 	}
 
+	/// Map a file into memory for fast parallel random access.
+	///
+	/// This uses `mmap` to map the file into memory.  **It will fail** and return `None` if the
+	/// file is compressed or fragmented.  If the [`DontCompress`](write::BlockFlags::DontCompress)
+	/// and [`DontFragment`](write::BlockFlags::DontFragment) options are set for a file at
+	/// archive creation time, it will be added to the archive in one contiguous unmodified chunk.
+	/// This is necessary because `mmap` provides a view into a file exactly as it is on-disk;
+	/// there is no opportunity for the library to apply decompression or other transformations
+	/// when mapping.
+	///
+	///     let map = file.mmap().expect("File is not mmappable");
+	///     println!("{}", str::from_utf8(map)?);
 	pub fn mmap<'b>(&'b mut self) -> Option<&'b [u8]> {
 		let inode = unsafe { &***self.node.inode };
 		let (start, frag_idx) = unsafe {
@@ -174,14 +250,34 @@ impl<'a> std::fmt::Debug for File<'a> {
 	}
 }
 
+/// Enum type for the various kinds of data that an inode can be.
+///
+/// This is retrieved by calling [`Node::data`] and can be matched to determine the type and
+/// contents of a node.
+///
+/// For accessing files and directories, [`Node`] provides the [`as_dir`](Node::as_dir) and
+/// [`as_file`](Node::as_file) methods to bypass `Data` completely.
 #[derive(Debug)]
 pub enum Data<'a> {
+	/// A regular file, containing a [`File`] object that can be used to extract the file contents.
 	File(File<'a>),
+
+	/// A directory, containing a [`Dir`] that can be used to access the directory's children.
 	Dir(Dir<'a>),
-	Symlink(String),
+
+	/// A symbolic link, containing the target of the link as a [`PathBuf`].
+	Symlink(PathBuf),
+
+	/// A block device file, containing the device's major and minor numbers.
 	BlockDev(u32, u32),
+
+	/// A character device file, containing the device's major and minor numbers.
 	CharDev(u32, u32),
+
+	/// A named pipe.
 	Fifo,
+
+	/// A socket.
 	Socket,
 }
 
@@ -198,10 +294,12 @@ impl<'a> Data<'a> {
 			SQFS_INODE_TYPE_SQFS_INODE_DIR | SQFS_INODE_TYPE_SQFS_INODE_EXT_DIR => Ok(Self::Dir(Dir::new(node)?)),
 			SQFS_INODE_TYPE_SQFS_INODE_FILE | SQFS_INODE_TYPE_SQFS_INODE_EXT_FILE => Ok(Self::File(File::new(node)?)),
 			SQFS_INODE_TYPE_SQFS_INODE_SLINK => Ok(unsafe {
-				Self::Symlink(arr_to_string(&(***node.inode).extra, (***node.inode).data.slink.target_size as usize))
+				let path_str = arr_to_string(&(***node.inode).extra, (***node.inode).data.slink.target_size as usize);
+				Self::Symlink(PathBuf::from(path_str))
 			}),
 			SQFS_INODE_TYPE_SQFS_INODE_EXT_SLINK => Ok(unsafe {
-				Self::Symlink(arr_to_string(&(***node.inode).extra, (***node.inode).data.slink_ext.target_size as usize))
+				let path_str = arr_to_string(&(***node.inode).extra, (***node.inode).data.slink_ext.target_size as usize);
+				Self::Symlink(PathBuf::from(path_str))
 			}),
 			SQFS_INODE_TYPE_SQFS_INODE_BDEV => Ok(unsafe {
 				let (maj, min) = get_dev_nums((***node.inode).data.dev.devno);
@@ -225,6 +323,8 @@ impl<'a> Data<'a> {
 		}
 	}
 	
+	/// Get a human-readable English name for the type of file represented by this object, intended
+	/// primarily for debugging.
 	pub fn name(&self) -> String {
 		match self {
 			Data::File(_) => "regular file",
@@ -238,6 +338,7 @@ impl<'a> Data<'a> {
 	}
 }
 
+/// Represents the namespace of extended attributes.
 #[repr(u32)]
 #[derive(Clone, Copy)]
 pub enum XattrType {
@@ -246,6 +347,17 @@ pub enum XattrType {
 	Security = SQFS_XATTR_TYPE_SQFS_XATTR_SECURITY,
 }
 
+/// An object packaging a [`File`] with the [`Node`] from which it was constructed.
+///
+/// `File`s reference data in the `Node` objects that created them, so a `File` cannot be used
+/// after its corresponding `Node` has been dropped.  This object packages the two together,
+/// creating an object that is valid for the lifetime of the owning `Archive`.
+///
+/// This is a simple wrapper around an [`OwningHandle`] that re-implements the [`Read`] and
+/// [`Seek`] traits so that it can still be treated as a file.  [`Deref`](std::ops::Deref) and
+/// [`DerefMut`](std::ops::DerefMut) are also available to access the contained file.
+///
+/// Create an `OwnedFile` using [`Node::into_owned_file`].
 pub struct OwnedFile<'a> {
 	handle: OwningHandle<Box<Node<'a>>, Box<File<'a>>>,
 }
@@ -276,6 +388,15 @@ impl<'a> std::ops::DerefMut for OwnedFile<'a> {
 	}
 }
 
+/// An object packaging a [`Dir`] with the [`Node`] from which it was constructed.
+///
+/// `Dir`s retain references to the `Node`s that created them, so a `Dir` cannot be used after its
+/// corresponding `Node` has been dropped.  `OwnedDir` packages the two together, creating an
+/// independent object with the same lifetime as its owning `Archive`.
+///
+/// `OwnedDir` re-implements [`Iterator`](std::iter::Iterator) so that it can be iterated over just
+/// like `Dir`.  It also implements [`Deref`](std::ops::Deref) and [`DerefMut`](std::ops::DerefMut)
+/// to allow access to the internal `Dir`.
 pub struct OwnedDir<'a> {
 	handle: OwningHandle<Box<Node<'a>>, Box<Dir<'a>>>,
 }
@@ -302,6 +423,17 @@ impl<'a> std::ops::DerefMut for OwnedDir<'a> {
 	}
 }
 
+/// Information about a single node in the directory tree.
+///
+/// This corresponds to the inode and directory entry structures of the underlying library.
+/// Because SquashFS inodes do not retain pointers back to their directory entries, inodes by
+/// default have no information about their positions in the directory tree.  To work around this,
+/// `Node` structs store their path and propagate it through calls like [`child`](Dir::child) and
+/// [`parent`](Self::parent).  If the `Node` was originally constructed in a way that does not
+/// provide path information, such as retrieving a node by inode number using [`Archive::get_id`],
+/// then the methods that require knowledge of the node's location in the tree, such as
+/// [`path`](Self::path) and [`parent`](Self::parent), will fail.  For this reason, it is generally
+/// recommended to get nodes by path when possible.
 pub struct Node<'a> {
 	container: &'a Archive,
 	path: Option<PathBuf>,
@@ -313,6 +445,7 @@ impl<'a> Node<'a> {
 		Ok(Self { container: container, path: path, inode: Arc::new(inode) })
 	}
 
+	/// Get a node's extended attributes in a given namespace as a map of byte Vecs.
 	pub fn xattrs(&self, category: XattrType) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
 		if self.container.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_NO_XATTRS as u16 != 0 { Ok(HashMap::new()) }
 		// TODO The following line reflects what I think is a bug.  I have a non-xattr archive
@@ -353,14 +486,23 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// Get the inode number of a node.
+	///
+	/// This can be used to cheaply compare nodes for equality or can be later used with
+	/// [`get_id`](Archive::get_id) to retrieve nodes without traversing the directory tree.
 	pub fn id(&self) -> u32 {
 		unsafe { (***self.inode).base.inode_number }
 	}
 
+	/// Retrieve the data stored at the node.
 	pub fn data(&self) -> Result<Data> {
 		Data::new(&self)
 	}
 
+	/// Get the absolute path to the node in the archive.
+	///
+	/// If the node was obtained in a way that did not provide path information, this will return
+	/// `None`.  If the node was retrieved using [`Archive::get`], this should return `Some`.
 	pub fn path(&self) -> Option<&Path> {
 		self.path.as_ref().map(|path| path.as_path())
 	}
@@ -372,10 +514,18 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// A convenience method to retrieve the file name of the node from its path.
+	///
+	/// As with [`path`](Self::path), if the node does not have embedded path information, this
+	/// will return `None`.
 	pub fn name(&self) -> Option<String> {
 		self.path.as_ref().map(|path| path.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or("/".to_string()))
 	}
 
+	/// Get the parent directory node of the current node.
+	///
+	/// If the node is the root of the tree, it will return a copy of itself.  If this node was
+	/// created without path information, it will raise a [`NoPath`](SquashfsError::NoPath) error.
 	pub fn parent(&self) -> Result<Self> {
 		self.path.as_ref().map(|path| {
 			let ppath = path.parent().unwrap_or(&Path::new(""));
@@ -383,6 +533,10 @@ impl<'a> Node<'a> {
 		}).ok_or(SquashfsError::NoPath)?
 	}
 
+	/// Resolve symbolic links to their targets, raising an error if a target does not exist.
+	///
+	/// This works the same way as [`resolve`](Self::resolve), except that an error is raised if
+	/// any link in the chain of symbolic links points at a path that does not exist.
 	pub fn resolve_exists(&self) -> Result<Self> {
 		let mut visited = HashSet::new();
 		let mut cur = Box::new(self.clone());
@@ -410,10 +564,20 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// Resolve symbolic links to their targets.
+	///
+	/// This follows the chain of symbolic links starting at the current node all the way to the
+	/// end, returning the final node, which is guaranteed not to be a symbolic link.  If any link
+	/// in the chain points at a path that does not exist, it returns `Ok(None)`.  If the current
+	/// node is not a sybmolic link, this returns a copy of itself.
 	pub fn resolve(&self) -> Result<Option<Self>> {
 		enoent_ok(self.resolve_exists())
 	}
 
+	/// Return true if the current `Node` is a file.
+	///
+	/// This does *not* resolve symbolic links, and will return `false` when called on nodes that
+	/// are symbolic links to files.
 	pub fn is_file(&self) -> Result<bool> {
 		match self.data()? {
 			Data::File(_) => Ok(true),
@@ -421,6 +585,11 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// Fetch the [`File`] object from the current `Node`.
+	///
+	/// This is essentially a shortcut for `if let Data::File(file) = self.data()`.  If this node
+	/// is not a regular file, this will return an error.  This does *not* resolve symbolic links;
+	/// the caller should call [`resolve`](Self::resolve) first if the node could be a link.
 	pub fn as_file(&self) -> Result<File> {
 		match self.data()? {
 			Data::File(f) => Ok(f),
@@ -428,11 +597,20 @@ impl<'a> Node<'a> {
 		}
 	}
 	
+	/// Convert the `Node` into an [`OwnedFile`].
+	///
+	/// This resolves symbolic links.  If the current node is not a regular file or a link to one,
+	/// it will return an error.
+	///
+	///     let archive = Archive::new("archive.sfs")?;
+	///     let mut buf = String::new();
+	///     archive.get("/file.txt")?.unwrap().into_owned_file()?.read_to_string(&mut buf)?;
 	pub fn into_owned_file(self) -> Result<OwnedFile<'a>> {
 		let resolved = self.resolve_exists()?;
 		Ok(OwnedFile { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_file().map(|x| Box::new(x)) })? })
 	}
 
+	/// Return true if the current `Node` is a directory.
 	pub fn is_dir(&self) -> Result<bool> {
 		match self.data()? {
 			Data::Dir(_) => Ok(true),
@@ -440,6 +618,11 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// Fetch the [`Dir`] object from the current `Node`.
+	///
+	/// This is essentially a shortcut for `if let Data::Dir(dir) = self.data()`.  If this node is
+	/// not a directory, it will return an error.  This does *not* resolve symbolic links; the
+	/// caller should call [`resolve`](Self::resolve) first if the node could be a link.
 	pub fn as_dir(&self) -> Result<Dir> {
 		match self.data()? {
 			Data::Dir(d) => Ok(d),
@@ -447,25 +630,38 @@ impl<'a> Node<'a> {
 		}
 	}
 
+	/// Convert the `Node` into an [`OwnedDir`].
+	///
+	/// This resolves symbolic links.  If the current node is not a directory or a link to one, it
+	/// will return an error.
+	///
+	///     let archive = Archive::new("archive.sfs")?;
+	///     for child in archive.get("/dir")?.unwrap().into_owned_dir()? {
+	///         println!("{}", child?.name());
+	///     }
 	pub fn into_owned_dir(self) -> Result<OwnedDir<'a>> {
 		let resolved = self.resolve_exists()?;
 		Ok(OwnedDir { handle: OwningHandle::try_new(Box::new(resolved), |x| unsafe { (*x).as_dir().map(|x| Box::new(x)) })? })
 	}
 
+	/// Get the UID of the `Node`.
 	pub fn uid(&self) -> Result<u32> {
 		let idx = unsafe { (***self.inode).base.uid_idx };
 		self.container.id_lookup(idx)
 	}
 
+	/// Get the GID of the `Node`.
 	pub fn gid(&self) -> Result<u32> {
 		let idx = unsafe { (***self.inode).base.gid_idx };
 		self.container.id_lookup(idx)
 	}
 
+	/// Get the file mode of the `Node`.
 	pub fn mode(&self) -> u16 {
 		unsafe { (***self.inode).base.mode }
 	}
 
+	/// Get the modification time of the `Node` as a UNIX timestamp.
 	pub fn mtime(&self) -> u32 {
 		unsafe { (***self.inode).base.mod_time }
 	}
@@ -490,6 +686,7 @@ impl<'a> std::fmt::Debug for Node<'a> {
 	}
 }
 
+/// An open SquashFS archive.
 pub struct Archive {
 	path: PathBuf,
 	file: ManagedPointer<sqfs_file_t>,
@@ -499,6 +696,7 @@ pub struct Archive {
 }
 
 impl Archive {
+	/// Open an existing archive for reading.
 	pub fn new<T: AsRef<Path>>(path: T) -> Result<Self> {
 		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
 		let file = sfs_init_check_null(&|| unsafe {
@@ -515,7 +713,6 @@ impl Archive {
 		//let map = MemoryMap::new(superblock.bytes_used as usize, &vec![MapOption::MapReadable, MapOption::MapFd(os_file.as_raw_fd())])?;
 		Ok(Self { path: path.as_ref().to_path_buf(), file: file, superblock: superblock, compressor_config: compressor_config, mmap: (os_file, map) })
 	}
-
 
 	fn compressor(&self) -> Result<ManagedPointer<sqfs_compressor_t>> {
 		Ok(sfs_init_ptr(&|x| unsafe {
@@ -541,14 +738,17 @@ impl Archive {
 		}, "Couldn't get ID from ID table")?)
 	}
 
+	/// Retrieve the path with that was used to open the archive.
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
 
+	/// Get the number of inodes in the archive.
 	pub fn size(&self) -> u32 {
 		self.superblock.inode_count
 	}
 
+	/// Get the [`Node`] located at the given path, raising an error if it does not exist.
 	pub fn get_exists<T: AsRef<Path>>(&self, path: T) -> Result<Node> {
 		let compressor = self.compressor()?;
 		let dir_reader = sfs_init_check_null(&|| unsafe {
@@ -570,10 +770,20 @@ impl Archive {
 		}
 	}
 
+	/// Get the [`Node`] located at the given path in the archive.
+	///
+	/// If the path is not present, `Ok(None)` will be returned.
 	pub fn get<T: AsRef<Path>>(&self, path: T) -> Result<Option<Node>> {
 		enoent_ok(self.get_exists(path))
 	}
 
+	/// Get a node from the archive by its inode number.
+	///
+	/// Each inode in an archive has a unique ID.  If the archive was created with the "exportable"
+	/// option (intended for exporting over NFS), it is efficient to look up inodes by their IDs.
+	/// If this archive is not exportable, [`SquashfsError::Unsupported`] will be raised.  A `Node`
+	/// obtained in this way will lack path information, and as such operations like getting its
+	/// file name or parent will fail.
 	pub fn get_id(&self, id: u64) -> Result<Node> {
 		if self.superblock.flags & SQFS_SUPER_FLAGS_SQFS_FLAG_EXPORTABLE as u16 == 0 { Err(SquashfsError::Unsupported("inode indexing".to_string()))?; }
 		if id <= 0 || id > self.superblock.inode_count as u64 { Err(SquashfsError::Range(id, self.superblock.inode_count as u64))? }
