@@ -477,7 +477,7 @@ impl<'a> std::ops::DerefMut for OwnedDir<'a> {
 /// This corresponds to the inode and directory entry structures of the underlying library.
 /// Because SquashFS inodes do not retain pointers back to their directory entries, inodes by
 /// default have no information about their positions in the directory tree.  To work around this,
-/// `Node` structs store their path and propagate it through calls like [`child`](Dir::child) and
+/// a `Node` struct stores its path and propagate it through calls like [`child`](Dir::child) and
 /// [`parent`](Self::parent).  If the `Node` was originally constructed in a way that does not
 /// provide path information, such as retrieving a node by inode number using [`Archive::get_id`],
 /// then the methods that require knowledge of the node's location in the tree, such as
@@ -781,7 +781,7 @@ impl Archive {
 		let mut locked_readers = self.data_readers.lock().expect(LOCK_ERR);
 		let ret = match locked_readers.pop() {
 			Some(reader) => reader,
-			None => { println!("Made data reader"); DataReader::new(&self)? },
+			None => { DataReader::new(&self)? },
 		};
 		Ok(Leased::new(&self.data_readers, ret))
 	}
@@ -860,6 +860,7 @@ impl Archive {
 			sfs_check(sqfs_meta_reader_read(*export_reader, &mut noderef as *mut u64 as *mut libc::c_void, 8), "Couldn't read inode reference")?;
 		}
 		let (block, offset) = unpack_meta_ref(noderef);
+		println!("Node {} at block {}, offset {}", id, block, offset);
 		let inode = sfs_init_ptr(&|x| unsafe {
 			sqfs_meta_reader_read_inode(*export_reader, &self.superblock, block, offset, x)
 		}, "Couldn't read inode", libc_free)?;

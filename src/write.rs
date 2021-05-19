@@ -460,9 +460,10 @@ impl Writer {
 			_ => None,
 		};
 		let mut nodes = self.nodes.lock().expect("Poisoned lock");
-		unsafe { (***inode).base.inode_number = nodes.len() as u32 + 1; }
+		let nodenum = nodes.len() as u32 + 1;
+		unsafe { (***inode).base.inode_number = nodenum; }
 		nodes.push(RefCell::new(IntermediateNode { inode: inode, dir_children: dir_children, pos: 0 }));
-		Ok(nodes.len() as u32)
+		Ok(nodenum)
 	}
 
 	/// Finish writing the archive and flush all contents to disk.
@@ -481,7 +482,7 @@ impl Writer {
 					sfs_check(sqfs_dir_writer_begin(*self.dir_writer, 0), "Couldn't start writing directory")?;
 					// For each child, need: name, ID, reference, mode
 					for (name, child_id) in children { // On disk children need to be sorted -- I think the library takes care of this
-						if child_id >= id { Err(SquashfsError::WriteOrder(id, child_id))?; }
+						if child_id >= id { Err(SquashfsError::WriteOrder(child_id))?; }
 						let child_node = &nodes[child_id as usize - 1].borrow();
 						let child = child_node.inode.as_ref();
 						let child_ref = child_node.pos;
@@ -523,6 +524,34 @@ impl Writer {
 unsafe impl Sync for Writer { }
 unsafe impl Send for Writer { }
 
+enum ChildMapEntry {
+	Accumulating(BTreeMap<OsString, u32>),
+	Done,
+}
+
+impl ChildMapEntry {
+	fn new() -> Self {
+		Self::Accumulating(BTreeMap::new())
+	}
+
+	fn add(&mut self, name: OsString, id: u32) -> Result<()> {
+		match self {
+			Self::Done => Err(SquashfsError::WriteOrder(id))?,
+			Self::Accumulating(children) => {
+				children.insert(name, id);
+				Ok(())
+			},
+		}
+	}
+
+	fn finish(&mut self) -> Result<BTreeMap<OsString, u32>> {
+		match std::mem::replace(self, Self::Done) {
+			Self::Done => Err(SquashfsError::Internal("Tried to finish directory in tree processor multiple times".to_string()))?,
+			Self::Accumulating(children) => Ok(children),
+		}
+	}
+}
+
 /// Tool to help create an archive from a directory in the filesystem.
 ///
 /// This wraps a [`Writer`] and takes care of tracking the directory hierarchy as files are added,
@@ -530,7 +559,7 @@ unsafe impl Send for Writer { }
 ///
 /// To simply create a SquashFS file from a chosen directory, call [`process`](Self::process):
 ///
-///     TreeProcessor::new("archive.sfs")?.process("/home/me/test")?
+///     TreeProcessor::new("archive.sfs")?.process("/home/me/test")?;
 ///
 /// For more control over the addition process -- for example, to exclude certain files, add
 /// extended attributes, ignore errors, or print files as they are added -- use
@@ -547,9 +576,14 @@ unsafe impl Send for Writer { }
 ///         }
 ///     }
 ///     processor.finish()?;
+///
+/// It is safe to process the tree using multiple threads, but it is *the caller's responsibility*
+/// to ensure that any out-of-order execution does not cause child nodes to be `add`ed after their
+/// parent directories.  If this happens, [`WriteOrder`](SquashfsError::WriteOrder) will be
+/// raised and the node will not be added.
 pub struct TreeProcessor {
 	writer: Mutex<Writer>,
-	childmap: Mutex<HashMap<PathBuf, BTreeMap<OsString, u32>>>,
+	childmap: Mutex<HashMap<PathBuf, ChildMapEntry>>,
 }
 
 impl TreeProcessor {
@@ -564,15 +598,14 @@ impl TreeProcessor {
 	/// It is not recommended to call this on `SourceFile`s that were not yielded by `iter`.
 	pub fn add(&self, mut source: SourceFile) -> Result<u32> {
 		let mut childmap = self.childmap.lock().expect("Poisoned lock");
-		if let SourceData::Dir(children) = &mut source.content.data {
-			// Pull in any last-minute additions made by the user
-			let mut new_children = childmap.remove(&source.path).unwrap_or(BTreeMap::new());
-			new_children.extend(children);
-			source.content.data = SourceData::Dir(Box::new(new_children.into_iter()));
+		if let SourceData::Dir(old_children) = &mut source.content.data {
+			let mut children = childmap.entry(source.path.clone()).or_insert(ChildMapEntry::new()).finish()?;
+			children.extend(old_children);
+			source.content.data = SourceData::Dir(Box::new(children.into_iter()));
 		}
 		let id = self.writer.lock().expect("Poisoned lock").add(source.content)?;
 		if let Some(parent) = source.path.parent() {
-			childmap.entry(parent.to_path_buf()).or_insert(BTreeMap::new()).insert(source.path.file_name().expect("Path from walkdir has no file name").to_os_string(), id);
+			childmap.entry(parent.to_path_buf()).or_insert(ChildMapEntry::new()).add(source.path.file_name().expect("Path from walkdir has no file name").to_os_string(), id)?;
 		}
 		Ok(id)
 	}
@@ -586,7 +619,7 @@ impl TreeProcessor {
 		let metadata = entry.metadata().unwrap();
 		let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
 		let data = if metadata.file_type().is_dir() {
-			SourceData::Dir(Box::new(self.childmap.lock().expect("Poisoned lock").remove(&entry.path().to_path_buf()).unwrap_or(BTreeMap::new()).into_iter()))
+			SourceData::Dir(Box::new(BTreeMap::new().into_iter()))
 		}
 		else if metadata.file_type().is_file() {
 			SourceData::File(Box::new(std::fs::File::open(entry.path())?))
@@ -648,12 +681,12 @@ impl<'a> std::iter::Iterator for TreeIterator<'a> {
 			Some(Ok(entry)) => {
 				let path = entry.path().to_path_buf();
 				Some(self.processor.make_source(entry).map(|source| SourceFile { path: path, content: source }))
-			}
+			},
 			Some(Err(e)) => {
 				let path = e.path().map(|x| x.to_string_lossy().into_owned()).unwrap_or("(unknown)".to_string());
 				eprintln!("Not processing {}: {}", path, e.to_string());
 				self.next()
-			}
+			},
 		}
 	}
 }

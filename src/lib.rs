@@ -61,9 +61,9 @@ type BoxedError = Box<dyn std::error::Error + std::marker::Send + std::marker::S
 #[repr(i32)]
 pub enum LibError {
 	#[error("Failed to allocate memory")] Alloc = SQFS_ERROR_SQFS_ERROR_ALLOC,
-	#[error("Generic I/O failure occurred")] Io = SQFS_ERROR_SQFS_ERROR_IO,
+	#[error("Generic I/O failure")] Io = SQFS_ERROR_SQFS_ERROR_IO,
 	#[error("Compressor failed to extract data")] Compressor = SQFS_ERROR_SQFS_ERROR_COMPRESSOR,
-	#[error("Internal error occurred")] Internal = SQFS_ERROR_SQFS_ERROR_INTERNAL,
+	#[error("Internal error")] Internal = SQFS_ERROR_SQFS_ERROR_INTERNAL,
 	#[error("Archive file appears to be corrupted")] Corrupted = SQFS_ERROR_SQFS_ERROR_CORRUPTED,
 	#[error("Unsupported feature used")] Unsupported = SQFS_ERROR_SQFS_ERROR_UNSUPPORTED,
 	#[error("Archive would overflow memory")] Overflow = SQFS_ERROR_SQFS_ERROR_OVERFLOW,
@@ -89,7 +89,7 @@ pub enum SquashfsError {
 	#[error("Encoded string is not valid UTF-8")] Utf8(#[from] std::string::FromUtf8Error),
 	#[error("OS string is not valid UTF-8")] OsUtf8(OsString),
 	#[error("{0}: {1}")] LibraryError(String, LibError),
-	#[error("{0}: Unknown error {1} in Squashfs library")] UnknownLibraryError(String, i32),
+	#[error("{0}: Unknown error {1} in SquashFS library")] UnknownLibraryError(String, i32),
 	#[error("{0}: Squashfs library did not return expected value")] LibraryReturnError(String),
 	#[error("{0}")] LibraryNullError(String),
 	#[error("Symbolic link chain exceeds {0} elements")] LinkChain(i32), // Can I use a const in the formatting string?
@@ -104,11 +104,12 @@ pub enum SquashfsError {
 	#[error("Memory mapping failed: {0}")] Mmap(std::io::Error),
 	#[error("Couldn't get the current system time: {0}")] Time(#[from] std::time::SystemTimeError),
 	#[error("Refusing to create empty archive")] Empty,
-	#[error("Tried to write directory {0} before child {1}")] WriteOrder(u32, u32),
+	#[error("Tried to write parent directory before child node {0}")] WriteOrder(u32),
 	#[error("Tried to write unknown or unsupported file type")] WriteType(std::fs::FileType),
 	#[error("Callback returned an error")] WrappedError(BoxedError),
 	#[error("Failed to retrieve xattrs for {0}: {1}")] Xattr(PathBuf, std::io::Error),
 	#[error("Tried to add files to a writer that was already finished")] Finished,
+	#[error("Internal error: {0}")] Internal(String),
 }
 
 /// Result type returned by SquashFS library operations.
@@ -127,7 +128,7 @@ fn sfs_check(code: i32, desc: &str) -> Result<i32> {
 fn sfs_destroy<T>(x: *mut T) {
 	unsafe {
 		let obj = x as *mut sqfs_object_t;
-		((*obj).destroy.expect("Squashfs object did not provide a destroy callback"))(obj);
+		((*obj).destroy.expect("SquashFS object did not provide a destroy callback"))(obj);
 	}
 }
 
