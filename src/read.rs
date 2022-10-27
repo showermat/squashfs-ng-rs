@@ -61,7 +61,7 @@ struct Leased<'a, T> {
 
 impl<'a, T> Leased<'a, T> {
 	pub fn new(pool: &'a Mutex<Vec<T>>, data: T) -> Self {
-		Self { pool: pool, data: ManuallyDrop::new(data) }
+		Self { pool, data: ManuallyDrop::new(data) }
 	}
 }
 
@@ -103,6 +103,9 @@ impl<'a, T> Drop for Leased<'a, T> {
 #[derive(Debug)]
 pub struct Dir<'a> {
 	node: &'a Node<'a>,
+	// TODO I believe this unread field is necessary so we don't drop the compressor instance that
+	// the reader uses.  1) Verify this.  2) Can we represent this dependency in such a way the
+	// Rust won't warn about not using this field?
 	compressor: ManagedPointer<sqfs_compressor_t>,
 	reader: Mutex<ManagedPointer<sqfs_dir_reader_t>>,
 }
@@ -114,7 +117,7 @@ impl<'a> Dir<'a> {
 			sqfs_dir_reader_create(&node.container.superblock, *compressor, *node.container.file, 0)
 		}, "Couldn't create directory reader", sfs_destroy)?;
 		unsafe { sfs_check(sqfs_dir_reader_open_dir(*reader, node.inode.as_const(), 0), "Couldn't open directory")?; }
-		Ok(Self { node: node, compressor: compressor, reader: Mutex::new(reader) })
+		Ok(Self {node, compressor, reader: Mutex::new(reader) })
 	}
 
 	/// Reset the directory reader to the beginning of the directory.
