@@ -2,7 +2,13 @@
 name = "squashfs-ng"
 version = "0.1.1"
 authors = ["Matthew Schauer <matthew.schauer@e10x.net>"]
-edition = "2018"
+edition = "2021"
+description = "High-level Rust wrapper for squashfs-tools-ng"
+readme = "readme.md"
+documentation = "https://docs.rs/squashfs-ng"
+repository = "https://github.com/showermat/squashfs-ng-rs"
+license = "Apache-2.0"
+categories = ["compression", "filesystem"]
 
 [build-dependencies]
 bindgen = "0.53.1"
