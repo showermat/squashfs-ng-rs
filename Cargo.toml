@@ -1,6 +1,6 @@
 [package]
 name = "squashfs-ng"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Matthew Schauer <matthew.schauer@e10x.net>"]
 edition = "2021"
 description = "High-level Rust wrapper for squashfs-tools-ng"
@@ -24,3 +24,9 @@ owning_ref = "0.4"
 thiserror = "1.0"
 walkdir = "2.3"
 xattr = "0.2"
+
+[features]
+hermetic = []
+
+[package.metadata.docs.rs]
+features = ["hermetic"]

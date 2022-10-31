@@ -37,6 +37,7 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use thiserror::Error;
 
+#[cfg(not(feature = "hermetic"))]
 mod bindings {
 	#![allow(non_camel_case_types)]
 	#![allow(non_snake_case)]
@@ -44,6 +45,8 @@ mod bindings {
 	#![allow(dead_code)]
 	include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
+#[cfg(feature = "hermetic")]
+mod bindings;
 
 use bindings::*;
 
