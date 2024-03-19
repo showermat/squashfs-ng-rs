@@ -11,7 +11,7 @@ license = "Apache-2.0"
 categories = ["compression", "filesystem"]
 
 [build-dependencies]
-bindgen = "0.53.1"
+bindgen = "0.69"
 
 [dependencies]
 lazy_static = "1.4"

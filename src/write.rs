@@ -23,13 +23,13 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{CString, OsString};
+use std::ffi::{CString};
+use std::fs::Metadata;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 use super::*;
-use super::SquashfsError;
 use walkdir::{DirEntry, WalkDir};
 
 /// Flags to fine-tune how an entry is added to the archive.
@@ -207,7 +207,7 @@ impl Source {
 			SourceData::Symlink(dest_os) => {
 				let dest = os_to_string(dest_os.as_os_str())?.into_bytes();
 				let mut ret = create_inode(SQFS_INODE_TYPE_SQFS_INODE_SLINK, dest.len());
-				let mut data = &mut (**ret).data.slink;
+				let data = &mut (**ret).data.slink;
 				data.nlink = link_count;
 				data.target_size = dest.len() as u32;
 				let dest_field = std::mem::transmute::<_, &mut [u8]>((**ret).extra.as_mut_slice(dest.len()));
@@ -216,14 +216,14 @@ impl Source {
 			},
 			SourceData::BlockDev(maj, min) => {
 				let mut ret = create_inode(SQFS_INODE_TYPE_SQFS_INODE_BDEV, 0);
-				let mut data = &mut (**ret).data.dev;
+				let data = &mut (**ret).data.dev;
 				data.nlink = link_count;
 				data.devno = Self::devno(*maj, *min);
 				ret
 			},
 			SourceData::CharDev(maj, min) => {
 				let mut ret = create_inode(SQFS_INODE_TYPE_SQFS_INODE_CDEV, 0);
-				let mut data = &mut (**ret).data.dev;
+				let data = &mut (**ret).data.dev;
 				data.nlink = link_count;
 				data.devno = Self::devno(*maj, *min);
 				ret
@@ -317,7 +317,7 @@ impl Writer {
 	/// If the file exists, it will be overwritten.
 	pub fn open<T: AsRef<Path>>(path: T) -> Result<Self> {
 		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
-		let block_size = SQFS_DEFAULT_BLOCK_SIZE as u64;
+		let block_size = SQFS_DEFAULT_BLOCK_SIZE as usize;
 		let num_workers = num_cpus::get() as u32;
 		let compressor_id = SQFS_COMPRESSOR_SQFS_COMP_ZSTD;
 		let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as u32;
@@ -340,7 +340,7 @@ impl Writer {
 			sqfs_block_writer_create(*outfile, 4096, 0)
 		}, "Couldn't create block writer", sfs_destroy)?;
 		let block_processor = Mutex::new(sfs_init_check_null(&|| unsafe {
-			sqfs_block_processor_create(block_size, *compressor, num_workers, 10 * num_workers as u64, *block_writer, *frag_table)
+			sqfs_block_processor_create(block_size, *compressor, num_workers, 10 * num_workers as usize, *block_writer, *frag_table)
 		}, "Couldn't create block processor", sfs_destroy)?);
 		let id_table = Mutex::new(sfs_init_check_null(&|| unsafe {
 			sqfs_id_table_create(0)
@@ -429,7 +429,7 @@ impl Writer {
 					sfs_check(sqfs_block_processor_begin_file(**block_processor, &mut **ret, ptr::null_mut(), flags), "Couldn't begin writing file")?;
 					let mut buf = vec![0; BLOCK_BUF_SIZE];
 					loop {
-						let rdsize = reader.read(&mut buf)? as u64;
+						let rdsize = reader.read(&mut buf)?;
 						if rdsize == 0 { break; }
 						sfs_check(sqfs_block_processor_append(**block_processor, &buf as &[u8] as *const [u8] as *const libc::c_void, rdsize), "Couldn't write file data block")?;
 					}
@@ -444,10 +444,10 @@ impl Writer {
 			sfs_check(sqfs_xattr_writer_begin(**xattr_writer, 0), "Couldn't start writing xattrs")?;
 			for (key, value) in &source.xattrs {
 				let ckey = CString::new(os_to_string(key)?)?;
-				sfs_check(sqfs_xattr_writer_add(**xattr_writer, ckey.as_ptr() as *const i8, value.as_ptr() as *const libc::c_void, value.len() as u64), "Couldn't add xattr")?;
+				sfs_check(sqfs_xattr_writer_add(**xattr_writer, ckey.as_ptr() as *const libc::c_char, value.as_ptr() as *const libc::c_void, value.len()), "Couldn't add xattr")?;
 			}
 			let xattr_idx = sfs_init(&|x| sqfs_xattr_writer_end(**xattr_writer, x), "Couldn't finish writing xattrs")?;
-			let mut base = &mut (***inode).base;
+			let base = &mut (***inode).base;
 			base.mode = source.mode;
 			sqfs_inode_set_xattr_index(**inode, xattr_idx);
 			let id_table = self.id_table.lock().expect("Poisoned lock");
@@ -515,7 +515,7 @@ impl Writer {
 			self.superblock.bytes_used = self.outfile_size();
 			sfs_check(sqfs_super_write(&self.superblock, *self.outfile), "Couldn't rewrite archive superblock")?;
 			let padding: Vec<u8> = vec![0; PAD_TO - self.outfile_size() as usize % PAD_TO];
-			sfs_check((**self.outfile).write_at.expect("File does not provide write_at")(*self.outfile, self.outfile_size(), &padding as &[u8] as *const [u8] as *const libc::c_void, padding.len() as u64), "Couldn't pad file")?;
+			sfs_check((**self.outfile).write_at.expect("File does not provide write_at")(*self.outfile, self.outfile_size(), &padding as &[u8] as *const [u8] as *const libc::c_void, padding.len()), "Couldn't pad file")?;
 		}
 		Ok(())
 	}
@@ -610,6 +610,25 @@ impl TreeProcessor {
 		Ok(id)
 	}
 
+	#[cfg(target_os = "linux")]
+	fn apply_metadata(source: &mut Source, metadata: Metadata) {
+		use std::os::linux::fs::MetadataExt;
+		source.uid = metadata.st_uid();
+		source.gid = metadata.st_gid();
+		source.mode = (metadata.st_mode() & !S_IFMT) as u16;
+	}
+
+	#[cfg(target_os = "unix")]
+	fn apply_metadata(source: &mut Source, metadata: Metadata) {
+		use std::os::unix::fs::MetadataExt;
+		source.uid = metadata.uid();
+		source.gid = metadata.gid();
+		source.mode = (metadata.mode() & 0x1ff) as u16;
+	}
+
+	#[cfg(all(not(target_os = "linux"), not(target_os = "unix")))]
+	fn apply_metadata(_source: &mut Source, _metadata: Metadata) { }
+
 	/// Finish writing the archive.
 	pub fn finish(&self) -> Result<()> {
 		self.writer.lock().expect("Poisoned lock").finish()
@@ -631,17 +650,8 @@ impl TreeProcessor {
 			Err(SquashfsError::WriteType(metadata.file_type()))?;
 			unreachable!();
 		};
-		let source = if cfg!(linux) {
-			use std::os::linux::fs::MetadataExt;
-			Source { data: data, xattrs: file_xattrs(entry.path())?, uid: metadata.st_uid(), gid: metadata.st_gid(), mode: (metadata.st_mode() & !S_IFMT) as u16, modified: mtime, flags: 0 }
-		}
-		else if cfg!(unix) {
-			use std::os::unix::fs::MetadataExt;
-			Source { data: data, xattrs: HashMap::new(), uid: metadata.uid(), gid: metadata.gid(), mode: (metadata.mode() & 0x1ff) as u16, modified: mtime, flags: 0 }
-		}
-		else {
-			Source { data: data, xattrs: HashMap::new(), uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 }
-		};
+		let mut source = Source { data: data, xattrs: file_xattrs(entry.path())?, uid: 0, gid: 0, mode: 0x1ff, modified: mtime, flags: 0 };
+		Self::apply_metadata(&mut source, metadata);
 		Ok(source)
 	}
 

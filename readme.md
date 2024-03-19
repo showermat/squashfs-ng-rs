@@ -16,6 +16,6 @@ This library wraps the [squashfs-tools-ng](https://github.com/AgentD/squashfs-to
         },
     }
 
-Squashfs-tools-ng must be installed to build or use this library -- for example, [squashfs-tools-ng](https://aur.archlinux.org/packages/squashfs-tools-ng) in the AUR for Arch Linux.
+Squashfs-tools-ng must be installed to build or use this library -- for example, [squashfs-tools-ng](https://aur.archlinux.org/packages/squashfs-tools-ng) in the AUR for Arch Linux.  The current commit is intended to be built against release [v1.3.0](https://github.com/AgentD/squashfs-tools-ng/releases/tag/v1.3.0).
 
 **See [the API documentation](http://docs.rs/squashfs-ng) for more.**

@@ -23,7 +23,7 @@ use std::io;
 use std::io::{Read, Seek};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf, Component};
+use std::path::{Path, Component};
 use std::sync::{Arc, Mutex};
 use super::*;
 use memmap::{Mmap, MmapOptions};
@@ -106,6 +106,7 @@ pub struct Dir<'a> {
 	// TODO I believe this unread field is necessary so we don't drop the compressor instance that
 	// the reader uses.  1) Verify this.  2) Can we represent this dependency in such a way the
 	// Rust won't warn about not using this field?
+	#[allow(dead_code)]
 	compressor: ManagedPointer<sqfs_compressor_t>,
 	reader: Mutex<ManagedPointer<sqfs_dir_reader_t>>,
 }
@@ -173,7 +174,7 @@ impl<'a> DataReader {
 	fn new(archive: &'a Archive) -> Result<Self> {
 		let compressor = archive.compressor()?;
 		let reader = sfs_init_check_null(&|| unsafe {
-			sqfs_data_reader_create(*archive.file, archive.superblock.block_size as u64, *compressor, 0)
+			sqfs_data_reader_create(*archive.file, archive.superblock.block_size as usize, *compressor, 0)
 		}, "Couldn't create data reader", sfs_destroy)?;
 		unsafe { sfs_check(sqfs_data_reader_load_fragment_table(*reader, &archive.superblock), "Couldn't load fragment table")? };
 		Ok(Self { compressor: compressor, reader: reader })
@@ -750,7 +751,7 @@ pub struct Archive {
 
 impl Archive {
 	/// Open an existing archive for reading.
-	pub fn new<T: AsRef<Path>>(path: T) -> Result<Self> {
+	pub fn open<T: AsRef<Path>>(path: T) -> Result<Self> {
 		let cpath = CString::new(os_to_string(path.as_ref().as_os_str())?)?;
 		let file = sfs_init_check_null(&|| unsafe {
 			sqfs_open_file(cpath.as_ptr(), SQFS_FILE_OPEN_FLAGS_SQFS_FILE_OPEN_READ_ONLY)
@@ -759,7 +760,7 @@ impl Archive {
 			sqfs_super_read(x, *file)
 		}, "Couldn't read archive superblock")?;
 		let compressor_config = sfs_init(&|x| unsafe {
-			sqfs_compressor_config_init(x, superblock.compression_id as u32, superblock.block_size as u64, SQFS_COMP_FLAG_SQFS_COMP_FLAG_UNCOMPRESS as u16)
+			sqfs_compressor_config_init(x, superblock.compression_id as u32, superblock.block_size as usize, SQFS_COMP_FLAG_SQFS_COMP_FLAG_UNCOMPRESS as u16)
 		}, "Couldn't read archive compressor config")?;
 		let os_file = std::fs::File::open(&path)?;
 		let map = unsafe { MmapOptions::new().map(&os_file).map_err(|e| SquashfsError::Mmap(e))? };
@@ -859,13 +860,12 @@ impl Archive {
 
 		let mut noderef: u64 = 0;
 		unsafe {
-			sfs_check(sqfs_meta_reader_seek(*export_reader, block_start, offset), "Couldn't seek to inode reference")?;
+			sfs_check(sqfs_meta_reader_seek(*export_reader, block_start, offset as usize), "Couldn't seek to inode reference")?;
 			sfs_check(sqfs_meta_reader_read(*export_reader, &mut noderef as *mut u64 as *mut libc::c_void, 8), "Couldn't read inode reference")?;
 		}
 		let (block, offset) = unpack_meta_ref(noderef);
-		println!("Node {} at block {}, offset {}", id, block, offset);
 		let inode = sfs_init_ptr(&|x| unsafe {
-			sqfs_meta_reader_read_inode(*export_reader, &self.superblock, block, offset, x)
+			sqfs_meta_reader_read_inode(*export_reader, &self.superblock, block, offset as usize, x)
 		}, "Couldn't read inode", libc_free)?;
 		Node::new(&self, inode, None)
 	}

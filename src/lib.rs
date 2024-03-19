@@ -124,7 +124,7 @@ fn sfs_check(code: i32, desc: &str) -> Result<i32> {
 		i => match FromPrimitive::from_i32(i) {
 			Some(e) => Err(SquashfsError::LibraryError(desc.to_string(), e)),
 			None => Err(SquashfsError::UnknownLibraryError(desc.to_string(), i)),
-		}
+		},
 	}
 }
 
