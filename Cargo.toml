@@ -1,6 +1,6 @@
 [package]
 name = "squashfs-ng"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Matthew Schauer <matthew.schauer@e10x.net>"]
 edition = "2021"
 description = "High-level Rust wrapper for squashfs-tools-ng"
